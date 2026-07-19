@@ -1,5 +1,4 @@
 import CoreGraphics
-import CoreImage
 import Foundation
 
 struct BoardCellCoordinate: Codable, Hashable, Sendable {
@@ -39,16 +38,14 @@ struct BoardVisualChange: Sendable {
 }
 
 final class BoardFrameDifferencer: @unchecked Sendable {
-    private let context = CIContext(options: [.cacheIntermediates: true])
-
     func signature(
         image: CGImage,
         frameSequence: UInt64,
         geometry: RecognitionBoardGeometry
     ) -> BoardFrameSignature {
-        let ciImage = CIImage(cgImage: image)
         let imageWidth = CGFloat(image.width)
         let imageHeight = CGFloat(image.height)
+        let imageBounds = CGRect(x: 0, y: 0, width: imageWidth, height: imageHeight)
         let horizontalSpacing = max(4, geometry.boundingBox.width * imageWidth / 8)
         let verticalSpacing = max(4, geometry.boundingBox.height * imageHeight / 9)
         let radius = min(horizontalSpacing, verticalSpacing) * 0.28
@@ -60,8 +57,8 @@ final class BoardFrameDifferencer: @unchecked Sendable {
                 let center = CGPoint(x: normalized.x * imageWidth, y: normalized.y * imageHeight)
                 let rect = CGRect(x: center.x - radius, y: center.y - radius,
                                   width: radius * 2, height: radius * 2)
-                    .intersection(ciImage.extent)
-                guard let fingerprint = averageFingerprint(in: ciImage, rect: rect) else { continue }
+                    .intersection(imageBounds)
+                guard let fingerprint = averageFingerprint(in: image, rect: rect) else { continue }
                 cells[BoardCellCoordinate(file: file, rank: rank)] = fingerprint
             }
         }
@@ -85,19 +82,35 @@ final class BoardFrameDifferencer: @unchecked Sendable {
         )
     }
 
-    private func averageFingerprint(in image: CIImage, rect: CGRect) -> CellVisualFingerprint? {
+    private func averageFingerprint(in image: CGImage, rect: CGRect) -> CellVisualFingerprint? {
         guard !rect.isNull, rect.width > 1, rect.height > 1,
-              let filter = CIFilter(name: "CIAreaAverage") else { return nil }
-        filter.setValue(image.cropped(to: rect), forKey: kCIInputImageKey)
-        filter.setValue(CIVector(cgRect: rect), forKey: kCIInputExtentKey)
-        guard let output = filter.outputImage else { return nil }
-        var rgba = [UInt8](repeating: 0, count: 4)
-        context.render(output, toBitmap: &rgba, rowBytes: 4,
-                       bounds: CGRect(x: 0, y: 0, width: 1, height: 1),
-                       format: .RGBA8, colorSpace: CGColorSpaceCreateDeviceRGB())
-        let r = Double(rgba[0]) / 255
-        let g = Double(rgba[1]) / 255
-        let b = Double(rgba[2]) / 255
+              let cropped = image.cropping(to: rect.integral) else { return nil }
+        let sampleSize = 4
+        var rgba = [UInt8](repeating: 0, count: sampleSize * sampleSize * 4)
+        rgba.withUnsafeMutableBytes { rawBuffer in
+            guard let context = CGContext(
+                data: rawBuffer.baseAddress,
+                width: sampleSize,
+                height: sampleSize,
+                bitsPerComponent: 8,
+                bytesPerRow: sampleSize * 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else { return }
+            context.interpolationQuality = .none
+            context.draw(cropped, in: CGRect(x: 0, y: 0, width: sampleSize, height: sampleSize))
+        }
+        let pixelCount = Double(sampleSize * sampleSize)
+        func channelAverage(offset: Int) -> Double {
+            var total = 0.0
+            for index in Swift.stride(from: offset, to: rgba.count, by: 4) {
+                total += Double(rgba[index])
+            }
+            return total / 255 / pixelCount
+        }
+        let r = channelAverage(offset: 0)
+        let g = channelAverage(offset: 1)
+        let b = channelAverage(offset: 2)
         return CellVisualFingerprint(
             red: r,
             green: g,

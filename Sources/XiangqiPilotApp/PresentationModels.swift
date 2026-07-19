@@ -246,7 +246,12 @@ final class PilotPresentationModel: ObservableObject {
     @Published var activeWorkspace: WorkspaceDestination
     @Published var previewMode: PreviewMode
     @Published var phase: PilotPhase
-    @Published var controlMode: ControlMode
+    @Published var controlMode: ControlMode {
+        didSet {
+            guard controlMode != oldValue else { return }
+            onControlModeChanged?(controlMode)
+        }
+    }
     @Published var engineSource: EngineSource {
         didSet {
             guard engineSource != oldValue else { return }
@@ -291,6 +296,7 @@ final class PilotPresentationModel: ObservableObject {
     var onRecognizePosition: (() -> Void)?
     var onApplyCorrection: (() -> Void)?
     var onConfirmMove: ((CandidateMove) -> Void)?
+    var onControlModeChanged: ((ControlMode) -> Void)?
     var onRecover: (() -> Void)?
     var onBeginRecovery: (() -> Void)?
     var onApplyRecoveryCandidate: (() -> Void)?

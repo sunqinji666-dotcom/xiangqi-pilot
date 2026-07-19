@@ -341,9 +341,39 @@ final class XiangqiVisionRecognizer: @unchecked Sendable {
 
                 let innerLuminance = luminance(innerColor)
                 let contrast = innerLuminance - luminance(outerColor)
+
+                // A glyph can occupy most of the centre of a piece (the
+                // moved black 卒 at c6/r4 is a good example), making the
+                // centre itself dark. Sample a four-point annulus as well;
+                // the porcelain body stays bright while a blank crossing has
+                // almost no radial contrast. The samples are deliberately
+                // kept inside the board so an empty corner cannot pass solely
+                // because it has a bright wood background.
+                let ringHalf = max(2, spacing * 0.075)
+                let ringOffsets: [(CGFloat, CGFloat)] = [
+                    (horizontalSpacing * 0.22, 0),
+                    (-horizontalSpacing * 0.22, 0),
+                    (0, verticalSpacing * 0.22),
+                    (0, -verticalSpacing * 0.22)
+                ]
+                let bodyLuminances = ringOffsets.compactMap { dx, dy -> Double? in
+                    let rect = CGRect(
+                        x: center.x + dx - ringHalf,
+                        y: center.y + dy - ringHalf,
+                        width: ringHalf * 2,
+                        height: ringHalf * 2
+                    ).intersection(ciImage.extent)
+                    guard let color = averageColor(in: ciImage, rect: rect) else { return nil }
+                    return luminance(color)
+                }
+                let annulusLuminance = bodyLuminances.isEmpty
+                    ? innerLuminance
+                    : bodyLuminances.reduce(0, +) / Double(bodyLuminances.count)
+                let annulusContrast = annulusLuminance - luminance(outerColor)
                 // An empty crossing has dark grid lines at its centre, while
                 // the porcelain-like centre of a piece is consistently bright.
-                if innerLuminance >= 0.62 && contrast >= 0.025 {
+                if (innerLuminance >= 0.62 && contrast >= 0.025) ||
+                    (bodyLuminances.count >= 3 && annulusLuminance >= 0.60 && annulusContrast >= 0.025) {
                     occupied.insert(BoardCellCoordinate(file: file, rank: rank))
                 }
             }
@@ -382,7 +412,10 @@ final class XiangqiVisionRecognizer: @unchecked Sendable {
                 request.recognitionLevel = .accurate
                 request.recognitionLanguages = ["zh-Hans", "zh-Hant"]
                 request.usesLanguageCorrection = false
-                request.minimumTextHeight = 0.08
+                // Small/moved pieces on the 象棋巫师 skin can be only a few
+                // dozen pixels high after the window is scaled. Keep this
+                // fallback local and cheap, but do not discard those glyphs.
+                request.minimumTextHeight = 0.05
                 request.customWords = canonicalWords
                 let handler = VNImageRequestHandler(cgImage: cellImage, orientation: .up)
                 guard (try? handler.perform([request])) != nil,
@@ -569,7 +602,10 @@ final class XiangqiVisionRecognizer: @unchecked Sendable {
     private func estimateSide(image: CGImage, normalizedPoint: CGPoint) -> RecognizedSide {
         let width = CGFloat(image.width)
         let height = CGFloat(image.height)
-        let radius = max(4, min(width / 90, height / 100))
+        // Sample most of the piece body rather than a tiny centre square. The
+        // centre is often occupied by a dark glyph, so use a moderately sized
+        // average and require a colour margin instead of a hard hue label.
+        let radius = max(6, min(width / 52, height / 58))
         let center = CGPoint(x: normalizedPoint.x * width, y: normalizedPoint.y * height)
         let rect = CGRect(x: center.x - radius, y: center.y - radius,
                           width: radius * 2, height: radius * 2)
@@ -586,6 +622,12 @@ final class XiangqiVisionRecognizer: @unchecked Sendable {
                          bounds: CGRect(x: 0, y: 0, width: 1, height: 1),
                          format: .RGBA8, colorSpace: CGColorSpaceCreateDeviceRGB())
         let red = Double(rgba[0]), green = Double(rgba[1]), blue = Double(rgba[2])
-        return red > green * 1.18 && red > blue * 1.18 ? .red : .black
+        if red - max(green, blue) >= 8,
+           red >= green * 1.10,
+           red >= blue * 1.10 {
+            return .red
+        }
+        if max(green, blue) - red >= 4 { return .black }
+        return .unknown
     }
 }

@@ -268,6 +268,10 @@ final class PilotRuntime: ObservableObject {
     private var recoveredOrAttemptedChangeKey: String?
     private var selectedBundleIdentifier: String?
     private var lastReconciledFrameSequence: UInt64 = 0
+    /// A candidate may be published repeatedly while SwiftUI redraws.  Keep one
+    /// pending automatic dispatch per exact board position so automatic mode
+    /// cannot send duplicate clicks for the same move.
+    private var automaticExecutionToken: String?
     private var game = Game()
     private var session: XiangqiSessionRecord?
 
@@ -530,9 +534,13 @@ final class PilotRuntime: ObservableObject {
                 await analyzeCurrentPosition()
                 return
             }
+            // A locally complete-looking board can still be wrong: OCR may
+            // consistently miss a real piece and therefore report matching
+            // piece/occupancy counts.  Any untrusted low-confidence board is
+            // eligible for the cloud visual review, which is allowed to fill
+            // only a small number of locally missed intersections.
             if !positionIsTrusted,
                snapshot.requiresHumanReview,
-               !snapshot.hasCompleteClassification,
                await recognizePositionWithAlibabaModel(
                    frame: frame,
                    calibration: calibration,
@@ -972,9 +980,11 @@ final class PilotRuntime: ObservableObject {
         )]
         presentation.selectedCandidateID = move.ucci
         presentation.phase = .previewing
+        scheduleAutomaticExecutionIfEligible()
     }
 
     private func execute(_ candidate: CandidateMove) async {
+        automaticExecutionToken = nil
         guard let move = Move(ucci: candidate.id),
               game.position.legalMoves.contains(move),
               let calibration else {
@@ -1218,6 +1228,54 @@ final class PilotRuntime: ObservableObject {
         presentation.candidates = candidates.isEmpty ? [.unavailable] : candidates
         presentation.selectedCandidateID = presentation.candidates[0].id
         presentation.phase = candidates.isEmpty ? .observing : .previewing
+        scheduleAutomaticExecutionIfEligible()
+    }
+
+    /// Automatic mode is intentionally gated here, after legal-move analysis,
+    /// rather than in the view.  This makes the click path identical to a
+    /// manually confirmed move and binds it to the exact trusted position.
+    private func scheduleAutomaticExecutionIfEligible() {
+        guard presentation.controlMode == .automatic,
+              !presentation.isPaused,
+              !presentation.isEmergencyStopped,
+              positionIsTrusted,
+              presentation.phase == .previewing else {
+            return
+        }
+        let candidate = presentation.selectedCandidate
+        guard candidate.id != CandidateMove.unavailable.id,
+              Move(ucci: candidate.id) != nil else {
+            return
+        }
+        let positionKey = game.position.key
+        let token = "\(positionKey)|\(candidate.id)"
+        guard automaticExecutionToken != token else { return }
+        automaticExecutionToken = token
+        presentation.recordEvent(
+            title: "自动模式已接管",
+            detail: "局面校验通过，准备执行 \(candidate.notation)",
+            symbolName: "bolt.fill",
+            tone: .attention
+        )
+        Task { [weak self] in
+            // Let the published preview settle, then re-check every safety
+            // condition immediately before any target-window input.
+            await Task.yield()
+            guard let self,
+                  self.automaticExecutionToken == token,
+                  self.presentation.controlMode == .automatic,
+                  !self.presentation.isPaused,
+                  !self.presentation.isEmergencyStopped,
+                  self.positionIsTrusted,
+                  self.game.position.key == positionKey,
+                  self.presentation.selectedCandidate.id == candidate.id else {
+                if self?.automaticExecutionToken == token {
+                    self?.automaticExecutionToken = nil
+                }
+                return
+            }
+            await self.execute(candidate)
+        }
     }
 
     private func configureIntelligence() async {
@@ -1326,9 +1384,15 @@ final class PilotRuntime: ObservableObject {
                     let visual = visualCoordinate(for: $0.square)
                     return BoardCellCoordinate(file: visual.column, rank: visual.row)
                 })
-                guard modelOccupancy == localOccupancy else {
+                // The model is specifically a recovery path for OCR misses.
+                // Permit it to add a small number of occupied intersections
+                // that local OCR failed to classify, but never let it remove a
+                // locally observed piece or invent a large part of the board.
+                let modelOnlyCells = modelOccupancy.subtracting(localOccupancy)
+                let localOnlyCells = localOccupancy.subtracting(modelOccupancy)
+                guard localOnlyCells.isEmpty, modelOnlyCells.count <= 3 else {
                     throw XiangqiError.invalidFEN(
-                        "模型返回\(modelOccupancy.count)枚，与本地占位\(localOccupancy.count)枚不一致"
+                        "模型占位与本地占位冲突：模型\(modelOccupancy.count)枚，本地\(localOccupancy.count)枚"
                     )
                 }
 
@@ -1355,7 +1419,7 @@ final class PilotRuntime: ObservableObject {
                 presentation.confidenceBasis = attempt.label
                 synchronizePresentation(position: position)
                 recognitionWarnings = response.warnings + [
-                    "已由\(attempt.label)复核；模型结果通过FEN、棋子上限与双将校验"
+                    "已由\(attempt.label)复核；允许补回\(modelOnlyCells.count)个本地漏检交点，并通过FEN、棋子上限与双将校验"
                 ]
                 statusMessage = "\(attempt.label)已确认\(recognizedPieceCount)枚局面"
                 presentation.recordEvent(
@@ -1445,8 +1509,10 @@ final class PilotRuntime: ObservableObject {
                     let visual = visualCoordinate(for: $0.square)
                     return BoardCellCoordinate(file: visual.column, rank: visual.row)
                 })
-                guard occupancy == localOccupancy else {
-                    failures.append("\(label)占位与本地检测不一致")
+                let modelOnlyCells = occupancy.subtracting(localOccupancy)
+                let localOnlyCells = localOccupancy.subtracting(occupancy)
+                guard localOnlyCells.isEmpty, modelOnlyCells.count <= 3 else {
+                    failures.append("\(label)占位与本地检测冲突")
                     continue
                 }
                 let latest = (try? await capture.latestFrame()) ?? frame
@@ -1903,6 +1969,10 @@ final class PilotRuntime: ObservableObject {
                         try await self.clickExecutor.arm()
                         self.blockingError = nil
                         self.statusMessage = "已恢复控制，执行前将重新校验棋盘"
+                        // The user may choose automatic mode while paused.
+                        // Resuming is therefore a new eligibility edge and
+                        // must re-queue the already analysed candidate.
+                        self.scheduleAutomaticExecutionIfEligible()
                     } catch {
                         self.pause(reason: PilotDiagnostic(error: error).displayText)
                     }
@@ -1928,6 +1998,10 @@ final class PilotRuntime: ObservableObject {
         presentation.onConfirmMove = { [weak self] candidate in
             guard let self else { return }
             Task { @MainActor in await self.execute(candidate) }
+        }
+        presentation.onControlModeChanged = { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in self.scheduleAutomaticExecutionIfEligible() }
         }
         presentation.onRecover = { [weak self] in
             guard let self else { return }

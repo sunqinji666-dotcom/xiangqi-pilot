@@ -360,6 +360,14 @@ actor ClickExecutor {
 
     @MainActor
     private static func activateThroughWorkspace(_ application: NSRunningApplication) async -> Bool {
+        // For an already-running target, ask AppKit for the normal direct
+        // foreground handoff first.  Re-opening its bundle alone can report a
+        // successful launch while leaving the cockpit frontmost.
+        _ = application.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+        try? await Task.sleep(for: .milliseconds(80))
+        if NSWorkspace.shared.frontmostApplication?.processIdentifier == application.processIdentifier {
+            return true
+        }
         guard let bundleURL = application.bundleURL else {
             return application.activate(options: [.activateAllWindows])
         }
