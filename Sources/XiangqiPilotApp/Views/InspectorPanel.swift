@@ -142,8 +142,17 @@ struct InspectorPanel: View {
                 .frame(maxWidth: .infinity)
             }
             .buttonStyle(CockpitActionButtonStyle(color: modeColor))
-            .disabled(model.isPaused || model.isEmergencyStopped)
-            .opacity(model.isPaused || model.isEmergencyStopped ? 0.42 : 1)
+            .disabled(
+                model.isPaused
+                    || model.isEmergencyStopped
+                    || model.phase != .previewing
+            )
+            .opacity(
+                model.isPaused
+                    || model.isEmergencyStopped
+                    || model.phase != .previewing
+                    ? 0.42 : 1
+            )
         }
         .padding(13)
         .cockpitPanel(cornerRadius: 13)

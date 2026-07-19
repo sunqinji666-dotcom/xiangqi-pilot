@@ -117,14 +117,25 @@ struct BoardCalibration: Hashable, Sendable {
     }
 
     func globalScreenPoint(for gridPoint: XiangqiGridPoint) throws -> CGPoint {
+        try globalScreenPoint(for: gridPoint, in: windowFrame)
+    }
+
+    /// Maps a board intersection into the target window's *current* global
+    /// frame. ScreenCaptureKit keeps the captured image coordinates stable
+    /// across a pure window move, so the calibration remains valid while the
+    /// global origin must be refreshed immediately before input.
+    func globalScreenPoint(for gridPoint: XiangqiGridPoint, in liveWindowFrame: CGRect) throws -> CGPoint {
         let point = imagePoint(for: gridPoint)
         guard containsInBoardROI(point, tolerance: 1) else {
             throw BoardCalibrationError.pointOutsideBoardROI
         }
+        guard matchesSize(windowFrame: liveWindowFrame) else {
+            throw BoardCalibrationError.invalidWindowFrame
+        }
 
         return CGPoint(
-            x: windowFrame.minX + point.x * windowFrame.width / imageSize.width,
-            y: windowFrame.minY + point.y * windowFrame.height / imageSize.height
+            x: liveWindowFrame.minX + point.x * liveWindowFrame.width / imageSize.width,
+            y: liveWindowFrame.minY + point.y * liveWindowFrame.height / imageSize.height
         )
     }
 
@@ -144,6 +155,13 @@ struct BoardCalibration: Hashable, Sendable {
         abs(windowFrame.minX - other.minX) <= tolerance
             && abs(windowFrame.minY - other.minY) <= tolerance
             && abs(windowFrame.width - other.width) <= tolerance
+            && abs(windowFrame.height - other.height) <= tolerance
+    }
+
+    /// A pure move does not invalidate calibration. Resizing remains a hard
+    /// boundary because the target app may re-layout its board non-linearly.
+    func matchesSize(windowFrame other: CGRect, tolerance: CGFloat = 0.5) -> Bool {
+        abs(windowFrame.width - other.width) <= tolerance
             && abs(windowFrame.height - other.height) <= tolerance
     }
 
@@ -224,7 +242,6 @@ struct BoardCalibration: Hashable, Sendable {
             corners.bottomLeft.x, corners.bottomLeft.y,
             corners.bottomRight.x, corners.bottomRight.y,
             imageSize.width, imageSize.height,
-            windowFrame.minX, windowFrame.minY,
             windowFrame.width, windowFrame.height
         ]
 

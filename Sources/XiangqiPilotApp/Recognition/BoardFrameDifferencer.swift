@@ -54,7 +54,16 @@ final class BoardFrameDifferencer: @unchecked Sendable {
         for rank in 0..<10 {
             for file in 0..<9 {
                 let normalized = geometry.intersectionPoint(file: file, rank: rank)
-                let center = CGPoint(x: normalized.x * imageWidth, y: normalized.y * imageHeight)
+                // Recognition geometry is expressed in Vision/Core Image
+                // coordinates (origin at bottom-left), while CGImage cropping
+                // uses pixel coordinates from the top-left. Without this
+                // inversion every changed intersection is attributed to the
+                // vertically mirrored rank: initial symmetric positions look
+                // fine, but the first real move can never match a legal move.
+                let center = CGPoint(
+                    x: normalized.x * imageWidth,
+                    y: (1 - normalized.y) * imageHeight
+                )
                 let rect = CGRect(x: center.x - radius, y: center.y - radius,
                                   width: radius * 2, height: radius * 2)
                     .intersection(imageBounds)

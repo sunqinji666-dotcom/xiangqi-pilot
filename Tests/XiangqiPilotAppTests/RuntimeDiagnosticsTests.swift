@@ -105,4 +105,13 @@ import Testing
         #expect(diagnostic.code == "operationFailed")
         #expect(diagnostic.displayText == "[PilotRuntime.operationFailed] 识别服务不可用")
     }
+
+    @Test func repeatedArmingIsIdempotentAndDoesNotInterruptTheOwner() async throws {
+        let executor = ClickExecutor()
+
+        try await executor.arm()
+        try await executor.arm()
+
+        #expect(await executor.state == .armed)
+    }
 }

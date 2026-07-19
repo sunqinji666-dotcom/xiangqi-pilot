@@ -190,6 +190,16 @@ actor ClickExecutor {
 
     func arm() throws {
         guard pendingReceipt == nil else { throw ClickExecutorError.anotherActionInFlight }
+        switch state {
+        case .armed:
+            // Arming is idempotent. A duplicate confirmation must not advance
+            // the epoch and invalidate a preflight that already owns it.
+            return
+        case .executing, .awaitingVerification:
+            throw ClickExecutorError.anotherActionInFlight
+        case .paused, .manualTakeover:
+            break
+        }
         safetyEpoch &+= 1
         state = .armed
     }
@@ -245,6 +255,18 @@ actor ClickExecutor {
         }
         guard let activationContext else { throw ClickExecutorError.targetWindowMissing }
 
+        // Resolve the exact locked window's current frame before attempting
+        // activation. The user may have moved it since calibration.
+        guard let initialLiveGeometry = await capture.currentLiveWindowGeometry(),
+              initialLiveGeometry.ownerPID == ownerPID,
+              initialLiveGeometry.windowID == windowID else {
+            throw ClickExecutorError.targetWindowMissing
+        }
+        guard calibration.matchesSize(windowFrame: initialLiveGeometry.frame) else {
+            throw ClickExecutorError.windowGeometryChanged
+        }
+        var currentTargetFrame = initialLiveGeometry.frame
+
         let activationRequest: Bool
         switch activationContext.1 {
             case .alreadyFrontmost:
@@ -272,7 +294,9 @@ actor ClickExecutor {
         // settle, then use the already-authorized Accessibility path once.
         let fallbackDelay: Duration = activationRequest ? .milliseconds(180) : .zero
         let fallbackNotBefore = clock.now.advanced(by: fallbackDelay)
+        let titleBarFallbackNotBefore = fallbackNotBefore.advanced(by: .milliseconds(260))
         var attemptedAccessibilityFallback = false
+        var attemptedTitleBarFallback = false
         var sawOnScreenTarget = false
         var sawFrontmostTarget = false
         var previousBoardSignature: BoardFrameSignature?
@@ -291,11 +315,31 @@ actor ClickExecutor {
                !attemptedAccessibilityFallback,
                clock.now >= fallbackNotBefore {
                 attemptedAccessibilityFallback = true
+                let expectedFrame = currentTargetFrame
                 _ = await MainActor.run {
                     Self.raiseMatchingTargetWindowWithAccessibility(
                         ownerPID: ownerPID,
-                        expectedFrame: calibration.windowFrame
+                        expectedFrame: expectedFrame
                     )
+                }
+            }
+
+            if frontmostPID != ownerPID,
+               attemptedAccessibilityFallback,
+               !attemptedTitleBarFallback,
+               clock.now >= titleBarFallbackNotBefore {
+                attemptedTitleBarFallback = true
+                let activationPoint = CGPoint(
+                    x: currentTargetFrame.midX,
+                    y: currentTargetFrame.minY + 15
+                )
+                if Self.targetWindowIsTopmost(
+                    windowID,
+                    ownerPID: ownerPID,
+                    expectedFrame: currentTargetFrame,
+                    at: [activationPoint]
+                ) {
+                    try await postActivationClick(at: activationPoint, epoch: epoch)
                 }
             }
 
@@ -305,11 +349,12 @@ actor ClickExecutor {
                let liveGeometry = frame.liveWindowGeometry,
                liveGeometry.ownerPID == ownerPID,
                liveGeometry.windowID == windowID {
+                currentTargetFrame = liveGeometry.frame
                 sawOnScreenTarget = sawOnScreenTarget || liveGeometry.isOnScreen
                 if liveGeometry.isOnScreen,
                    liveGeometry.layer == 0,
                    frontmostPID == ownerPID,
-                   calibration.matches(windowFrame: liveGeometry.frame),
+                   calibration.matchesSize(windowFrame: liveGeometry.frame),
                    abs(frame.imageSize.width - calibration.imageSize.width) <= 1,
                    abs(frame.imageSize.height - calibration.imageSize.height) <= 1,
                    frame.contentFingerprint != 0 {
@@ -363,7 +408,7 @@ actor ClickExecutor {
         // For an already-running target, ask AppKit for the normal direct
         // foreground handoff first.  Re-opening its bundle alone can report a
         // successful launch while leaving the cockpit frontmost.
-        _ = application.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+        _ = application.activate(options: [.activateAllWindows])
         try? await Task.sleep(for: .milliseconds(80))
         if NSWorkspace.shared.frontmostApplication?.processIdentifier == application.processIdentifier {
             return true
@@ -560,8 +605,11 @@ actor ClickExecutor {
                 calibration: calibration
             )
 
-            let sourcePoint = try calibration.globalScreenPoint(for: move.source)
-            let destinationPoint = try calibration.globalScreenPoint(for: move.destination)
+            guard let beforeWindowFrame = beforeFrame.liveWindowGeometry?.frame else {
+                throw ClickExecutorError.targetWindowMissing
+            }
+            let sourcePoint = try calibration.globalScreenPoint(for: move.source, in: beforeWindowFrame)
+            var destinationPoint = try calibration.globalScreenPoint(for: move.destination, in: beforeWindowFrame)
             try validatePoints(
                 sourcePoint,
                 destinationPoint,
@@ -578,17 +626,24 @@ actor ClickExecutor {
             // Re-check authority and geometry between the source selection and
             // destination click. A pause at this point leaves only a selected
             // piece; it does not send an unintended move.
-            try await validateLiveTarget(
+            let destinationGeometry = try await validateLiveTarget(
                 capture: capture,
                 binding: binding,
                 calibration: calibration,
                 actionID: actionID,
                 epoch: epoch
             )
+            // Follow a pure window translation that happened after selecting
+            // the piece. The destination is always derived from the latest
+            // frame of the same locked windowID.
+            destinationPoint = try calibration.globalScreenPoint(
+                for: move.destination,
+                in: destinationGeometry.frame
+            )
             guard Self.targetWindowIsTopmost(
                 binding.windowID,
                 ownerPID: binding.ownerPID,
-                expectedFrame: calibration.windowFrame,
+                expectedFrame: destinationGeometry.frame,
                 at: [destinationPoint]
             ) else {
                 throw ClickExecutorError.targetWindowOccluded
@@ -607,7 +662,7 @@ actor ClickExecutor {
                 beforeFrameSequence: beforeFrame.sequence,
                 beforeFrameFingerprint: beforeFrame.contentFingerprint,
                 beforeBoardStateHash: binding.recognizedBoardStateHash,
-                calibratedWindowFrame: calibration.windowFrame,
+                calibratedWindowFrame: destinationGeometry.frame,
                 calibratedImageSize: calibration.imageSize,
                 dispatchedAtUptime: ProcessInfo.processInfo.systemUptime,
                 minimumVerificationFrameSequence: beforeFrame.sequence &+ 1
@@ -658,7 +713,8 @@ actor ClickExecutor {
                   liveGeometry.layer == 0 else {
                 throw ClickExecutorError.targetMismatch
             }
-            guard Self.rectanglesMatch(receipt.calibratedWindowFrame, liveGeometry.frame),
+            guard abs(receipt.calibratedWindowFrame.width - liveGeometry.frame.width) <= 0.5,
+                  abs(receipt.calibratedWindowFrame.height - liveGeometry.frame.height) <= 0.5,
                   abs(receipt.calibratedImageSize.width - frame.imageSize.width) <= 1,
                   abs(receipt.calibratedImageSize.height - frame.imageSize.height) <= 1 else {
                 throw ClickExecutorError.windowGeometryChanged
@@ -776,7 +832,7 @@ actor ClickExecutor {
         calibration: BoardCalibration,
         actionID: UUID,
         epoch: UInt64
-    ) async throws {
+    ) async throws -> LiveWindowGeometry {
         guard MacPermissionsService.accessibilityStatus == .granted else {
             throw ClickExecutorError.accessibilityPermissionMissing
         }
@@ -791,6 +847,8 @@ actor ClickExecutor {
             windowID: binding.windowID,
             calibration: calibration
         )
+        guard let geometry else { throw ClickExecutorError.targetWindowMissing }
+        return geometry
     }
 
     private static func recognitionGeometry(from calibration: BoardCalibration) -> RecognitionBoardGeometry {
@@ -822,7 +880,7 @@ actor ClickExecutor {
         guard liveGeometry.layer == 0 else {
             throw ClickExecutorError.unexpectedWindowLayer(liveGeometry.layer)
         }
-        guard calibration.matches(windowFrame: liveGeometry.frame) else {
+        guard calibration.matchesSize(windowFrame: liveGeometry.frame) else {
             throw ClickExecutorError.windowGeometryChanged
         }
 
@@ -841,7 +899,7 @@ actor ClickExecutor {
         windowID: CGWindowID
     ) throws {
         guard let liveWindowFrame,
-              calibration.matches(windowFrame: liveWindowFrame),
+              calibration.matchesSize(windowFrame: liveWindowFrame),
               liveWindowFrame.insetBy(dx: -1, dy: -1).contains(source),
               liveWindowFrame.insetBy(dx: -1, dy: -1).contains(destination) else {
             throw ClickExecutorError.roiViolation
@@ -892,6 +950,43 @@ actor ClickExecutor {
         }
         mouseUp.post(tap: .cghidEventTap)
         try ensureStillExecuting(actionID: actionID, epoch: epoch)
+    }
+
+    /// Activates an already verified, unobscured target by clicking only its
+    /// title bar. This is a fallback for macOS 14+ where public activation APIs
+    /// may not cross displays/Spaces. It never touches the board ROI.
+    private func postActivationClick(at point: CGPoint, epoch: UInt64) async throws {
+        guard safetyEpoch == epoch,
+              case .armed = state,
+              pendingReceipt == nil else {
+            throw ClickExecutorError.interrupted
+        }
+        guard MacPermissionsService.accessibilityStatus == .granted else {
+            throw ClickExecutorError.accessibilityPermissionMissing
+        }
+        guard let source = CGEventSource(stateID: .hidSystemState),
+              let mouseDown = CGEvent(
+                  mouseEventSource: source,
+                  mouseType: .leftMouseDown,
+                  mouseCursorPosition: point,
+                  mouseButton: .left
+              ),
+              let mouseUp = CGEvent(
+                  mouseEventSource: source,
+                  mouseType: .leftMouseUp,
+                  mouseCursorPosition: point,
+                  mouseButton: .left
+              ) else {
+            throw ClickExecutorError.eventCreationFailed
+        }
+        mouseDown.post(tap: .cghidEventTap)
+        try await Task.sleep(nanoseconds: mouseDownDurationNanoseconds)
+        mouseUp.post(tap: .cghidEventTap)
+        guard safetyEpoch == epoch,
+              case .armed = state,
+              pendingReceipt == nil else {
+            throw ClickExecutorError.interrupted
+        }
     }
 
     private func ensureStillExecuting(actionID: UUID, epoch: UInt64) throws {

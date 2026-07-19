@@ -25,7 +25,7 @@ import XiangqiCore
         #expect(abs(bottomRight.y - 520) < 0.001)
     }
 
-    @Test func geometryHashChangesWhenWindowMoves() throws {
+    @Test func geometryHashIgnoresPureWindowMoveButChangesOnResize() throws {
         let corners = BoardCorners(
             topLeft: CGPoint(x: 10, y: 10),
             topRight: CGPoint(x: 810, y: 10),
@@ -41,7 +41,33 @@ import XiangqiCore
             imageSize: first.imageSize,
             windowFrame: CGRect(x: 300, y: 200, width: 820, height: 920)
         )
-        #expect(first.geometryHash != moved.geometryHash)
+        #expect(first.geometryHash == moved.geometryHash)
+
+        let resized = try first.recalibrated(
+            imageSize: CGSize(width: 900, height: 1_000),
+            windowFrame: CGRect(x: 300, y: 200, width: 900, height: 1_000)
+        )
+        #expect(first.geometryHash != resized.geometryHash)
+    }
+
+    @Test func liveWindowTranslationMovesClickPointsWithoutRecalibration() throws {
+        let calibration = try BoardCalibration(
+            corners: BoardCorners(
+                topLeft: CGPoint(x: 100, y: 80),
+                topRight: CGPoint(x: 900, y: 80),
+                bottomLeft: CGPoint(x: 100, y: 980),
+                bottomRight: CGPoint(x: 900, y: 980)
+            ),
+            imageSize: CGSize(width: 1_000, height: 1_100),
+            windowFrame: CGRect(x: 50, y: 30, width: 500, height: 550)
+        )
+        let movedFrame = CGRect(x: 350, y: 230, width: 500, height: 550)
+        let point = try calibration.globalScreenPoint(
+            for: XiangqiGridPoint(file: 0, rank: 0),
+            in: movedFrame
+        )
+        #expect(abs(point.x - 400) < 0.001)
+        #expect(abs(point.y - 270) < 0.001)
     }
 
     @Test func recognitionGeometryFindsPerspectiveIntersections() {
@@ -394,6 +420,205 @@ import XiangqiCore
         ) == .rejected)
     }
 
+    @Test func decoratedTransitionRequiresBothEndpointsButToleratesAHighlight() throws {
+        let move = try #require(Move(ucci: "b2b9"))
+        let decorated = BoardVisualChange(
+            fromFrameSequence: 30,
+            toFrameSequence: 31,
+            cells: [
+                (BoardCellCoordinate(file: 1, rank: 7), 0.48),
+                (BoardCellCoordinate(file: 1, rank: 0), 0.57),
+                // Persistent last-move or selection decoration.
+                (BoardCellCoordinate(file: 4, rank: 4), 0.12)
+            ]
+        )
+        #expect(RecognitionTransitionPolicy.decoratedLegalMove(
+            trusted: .standard,
+            orientation: .redAtBottom,
+            visualChange: decorated
+        ) == move)
+
+        let oneEndpointOnly = BoardVisualChange(
+            fromFrameSequence: 30,
+            toFrameSequence: 31,
+            cells: [
+                (BoardCellCoordinate(file: 1, rank: 7), 0.48),
+                (BoardCellCoordinate(file: 4, rank: 4), 0.12)
+            ]
+        )
+        #expect(RecognitionTransitionPolicy.decoratedLegalMove(
+            trusted: .standard,
+            orientation: .redAtBottom,
+            visualChange: oneEndpointOnly
+        ) == nil)
+    }
+
+    @Test func stableFourEndpointDeltaCanSynchronizeTwoConsecutivePlies() throws {
+        let first = try #require(Move(ucci: "h2e2"))
+        let afterFirst = try Position.standard.applying(first)
+        let second = try #require(afterFirst.legalMoves.first)
+        let cells = [first.from, first.to, second.from, second.to].map {
+            (BoardCellCoordinate(file: $0.file, rank: $0.rank), 0.58)
+        }
+        let change = BoardVisualChange(
+            fromFrameSequence: 40,
+            toFrameSequence: 41,
+            cells: cells
+        )
+        #expect(RecognitionTransitionPolicy.decoratedLegalLine(
+            trusted: .standard,
+            orientation: .redAtBottom,
+            visualChange: change
+        ) == [first, second])
+    }
+
+    @Test func dispatchedCannonMoveCanRecognizeRealWizardHorseReply() throws {
+        let first = try #require(Move(ucci: "h2e2"))
+        let reply = try #require(Move(ucci: "b9c7"))
+        let change = BoardVisualChange(
+            fromFrameSequence: 50,
+            toFrameSequence: 51,
+            cells: [first.from, first.to, reply.from, reply.to].map {
+                (BoardCellCoordinate(file: $0.file, rank: $0.rank), 0.60)
+            }
+        )
+        #expect(RecognitionTransitionPolicy.decoratedLegalReply(
+            trusted: .standard,
+            firstMove: first,
+            orientation: .redAtBottom,
+            visualChange: change
+        ) == reply)
+    }
+
+    @Test func wizardNotationResolvesVisibleMoveLogAgainstLegalMoves() throws {
+        let first = try #require(
+            XiangqiWizardMoveLogReader.uniqueLegalMove(
+                matching: "炮二平五",
+                in: .standard
+            )
+        )
+        #expect(first.ucci == "h2e2")
+        let afterFirst = try Position.standard.applying(first)
+        let reply = try #require(
+            XiangqiWizardMoveLogReader.uniqueLegalMove(
+                matching: "马８进７",
+                in: afterFirst
+            )
+        )
+        #expect(reply.ucci == "h9g7")
+        #expect(
+            XiangqiWizardMoveLogReader.normalizedNotation(for: reply, in: afterFirst)
+                == "马8进7"
+        )
+    }
+
+    @Test func wizardCannonAdvanceNotationResolvesAfterSixOpeningRounds() throws {
+        let ucciLine = [
+            "h2e2", "h9g7", "h0g2", "i9h9", "i0h0", "b9c7",
+            "b0a2", "g6g5", "b2c2", "a9b9", "a0b0"
+        ]
+        var position = Position.standard
+        for ucci in ucciLine {
+            let move = try #require(Move(ucci: ucci))
+            position = try position.applying(move)
+        }
+        let reply = try #require(
+            XiangqiWizardMoveLogReader.uniqueLegalMove(
+                matching: "炮２进４",
+                in: position
+            )
+        )
+        #expect(reply.ucci == "b7b3")
+    }
+
+    @Test func wizardChariotAdvanceNotationResolvesAfterAlternateOpening() throws {
+        let ucciLine = [
+            "c3c4", "g6g5", "b0c2", "h9g7", "a0a1", "c9e7",
+            "g0e2", "b9d8", "h0f1", "a9c9", "a1d1"
+        ]
+        var position = Position.standard
+        for ucci in ucciLine {
+            let move = try #require(Move(ucci: ucci))
+            position = try position.applying(move)
+        }
+        let reply = try #require(
+            XiangqiWizardMoveLogReader.uniqueLegalMove(
+                matching: "车９进１",
+                in: position
+            )
+        )
+        #expect(reply.ucci == "i9i8")
+    }
+
+    @Test func wizardOCRLineParserBindsLatestRoundToUniqueLegalMove() throws {
+        let first = try #require(Move(ucci: "h2e2"))
+        let afterFirst = try Position.standard.applying(first)
+        let move = XiangqiWizardMoveLogReader.uniqueLegalMove(
+            inRecognizedLines: [
+                "12. 车四进三 车4进3",
+                "13. 仕四进五 炮8进2"
+            ],
+            expectedPlyIndex: 25,
+            position: afterFirst
+        )
+        #expect(move?.ucci == "h7h5")
+
+        let reply = XiangqiWizardMoveLogReader.uniqueLegalMove(
+            inRecognizedLines: ["1. 炮二平五 马8进7"],
+            expectedPlyIndex: 1,
+            position: afterFirst
+        )
+        #expect(reply?.ucci == "h9g7")
+    }
+
+    @Test func wizardOCRNeverMatchesTheOtherPlayersIdenticalNotationColumn() throws {
+        // Real 象棋巫师 game from 2026-07-20. In round 13 both the
+        // red move already played and another legal black move normalize to
+        // "马3进4". The black column is "马8进7" and must win; scanning
+        // the whole row for any legal notation used to choose c7d5 and drift.
+        let played = [
+            "h2e2", "h9g7", "g3g4", "c6c5", "h0g2", "b9c7",
+            "i0h0", "i9h9", "b0a2", "h7h3", "a0a1", "h3g3",
+            "h0h9", "g7h9", "b2c2", "g3g0", "f0e1", "a9b9",
+            "c3c4", "g0g1", "c2c1", "g1c1", "a1c1", "b7b2",
+            "g2f4"
+        ]
+        var position = Position.standard
+        for ucci in played {
+            position = try position.applying(#require(Move(ucci: ucci)))
+        }
+
+        let move = XiangqiWizardMoveLogReader.uniqueLegalMove(
+            inRecognizedLines: ["13. 马三进四 马8进7"],
+            expectedPlyIndex: 25,
+            position: position
+        )
+        #expect(move?.ucci == "h9g7")
+
+        let rowBeforeBlackNotationWasRendered =
+            XiangqiWizardMoveLogReader.uniqueLegalMove(
+                inRecognizedLines: ["13. 马三进四"],
+                expectedPlyIndex: 25,
+                position: position
+            )
+        #expect(rowBeforeBlackNotationWasRendered == nil)
+    }
+
+    @Test func wizardTerminalDialogIsRecognizedWithoutMatchingOrdinaryButtons() {
+        #expect(XiangqiWizardMoveLogReader.terminalResult(in: [
+            "提和", "认输", "电脑认输,恭喜你取得胜利!", "再来一次"
+        ]) == .win)
+        #expect(XiangqiWizardMoveLogReader.terminalResult(in: [
+            "你认输,电脑取得胜利", "再来一次"
+        ]) == .loss)
+        #expect(XiangqiWizardMoveLogReader.terminalResult(in: [
+            "本局和棋", "再来一次"
+        ]) == .draw)
+        #expect(XiangqiWizardMoveLogReader.terminalResult(in: [
+            "提和", "认输", "悔棋"
+        ]) == nil)
+    }
+
     @Test func standardOpeningCanRecoverFromWrongPieceColoursButRejectsMovedKind() throws {
         let pieces = Position.standard.board.placements.map { placement in
             RecognizedPiece(
@@ -408,6 +633,9 @@ import XiangqiCore
         let noisyStandard = XiangqiRecognitionSnapshot(
             frameSequence: 1,
             pieces: Array(pieces.dropLast()),
+            occupiedCells: Set(pieces.map {
+                BoardCellCoordinate(file: $0.file, rank: $0.rank)
+            }),
             confidence: 0.42,
             warnings: ["颜色不确定"]
         )
@@ -435,6 +663,21 @@ import XiangqiCore
         )
         #expect(!StandardPositionRecognitionPolicy.matches(
             snapshot: afterCapture,
+            orientation: .redAtBottom
+        ))
+
+        let movedOccupancy = XiangqiRecognitionSnapshot(
+            frameSequence: 3,
+            pieces: pieces,
+            occupiedCells: Set(pieces.map {
+                BoardCellCoordinate(file: $0.file, rank: $0.rank)
+            }).subtracting([BoardCellCoordinate(file: 2, rank: 3)])
+                .union([BoardCellCoordinate(file: 2, rank: 4)]),
+            confidence: 0.99,
+            warnings: []
+        )
+        #expect(!StandardPositionRecognitionPolicy.matches(
+            snapshot: movedOccupancy,
             orientation: .redAtBottom
         ))
     }

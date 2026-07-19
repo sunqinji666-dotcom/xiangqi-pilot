@@ -450,6 +450,10 @@ private struct PositionSetupStep: View {
                         Task { await runtime.useStandardPositionForCorrection() }
                     }
                     .buttonStyle(SecondaryActionButtonStyle(compact: true))
+                    Button("恢复上次棋局") {
+                        Task { await runtime.restoreLatestSessionForCorrection() }
+                    }
+                    .buttonStyle(SecondaryActionButtonStyle(compact: true))
                     Button("重新识别") {
                         Task { await runtime.recognizeCurrentPosition() }
                     }

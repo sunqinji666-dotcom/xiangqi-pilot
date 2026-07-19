@@ -332,7 +332,7 @@ final class PilotPresentationModel: ObservableObject {
         previewMode: PreviewMode = .live,
         phase: PilotPhase = .previewing,
         controlMode: ControlMode = .confirm,
-        engineSource: EngineSource = .local,
+        engineSource: EngineSource = .ucci,
         modelSource: ModelSource = .off,
         selectedCandidateID: String = "cannon-center",
         confidence: Double = 0.987,
@@ -475,6 +475,7 @@ final class PilotPresentationModel: ObservableObject {
 
     func confirmSelectedMove() {
         guard !isPaused, !isEmergencyStopped else { return }
+        guard phase == .previewing else { return }
         guard selectedCandidate.id != CandidateMove.unavailable.id else { return }
         phase = .acting
         recordEvent(

@@ -158,6 +158,13 @@ enum StandardPositionRecognitionPolicy {
             expected[coordinate] = placement.piece.kind
         }
 
+        // OCR/template matching may hallucinate a moved piece back onto its
+        // familiar opening square. Occupancy is measured independently from
+        // glyph recognition, so an automatic standard-position recovery is
+        // safe only when every one of the 32 physical piece bodies occupies
+        // the exact opening intersection. Count alone is not sufficient.
+        guard snapshot.localOccupancy == Set(expected.keys) else { return false }
+
         var seen: Set<BoardCellCoordinate> = []
         for piece in snapshot.pieces {
             let coordinate = BoardCellCoordinate(file: piece.file, rank: piece.rank)
@@ -193,6 +200,18 @@ private struct RecoveryCandidate {
     let confidence: Double
     let source: PositionRecoverySource
     let canAutoApply: Bool
+}
+
+private struct PendingObservedMove {
+    let move: Move
+    let firstSeenAt: TimeInterval
+    var lastSeenAt: TimeInterval
+}
+
+private struct VerifiedMoveSequence {
+    let position: Position
+    let signature: BoardFrameSignature
+    let opponentReply: Move?
 }
 
 private enum RecoveryTimeoutError: LocalizedError {
@@ -272,8 +291,25 @@ final class PilotRuntime: ObservableObject {
     /// pending automatic dispatch per exact board position so automatic mode
     /// cannot send duplicate clicks for the same move.
     private var automaticExecutionToken: String?
+    /// Serializes every manual and automatic entry into the GUI action path.
+    /// Main-actor async methods are re-entrant, so without this guard a second
+    /// confirmation can arm the executor while the first one is activating the
+    /// target window and invalidate its safety epoch.
+    private var executionInProgress = false
+    private var pendingObservedMove: PendingObservedMove?
+    /// Used only to suppress the one-cell selection/last-move decoration that
+    /// 象棋巫师 removes shortly after a legal move has already been accepted.
+    /// It never authorizes a chess-state change.
+    private var lastAcceptedVisualMoveAt: TimeInterval?
+    private var lastWizardMoveOCRAttemptAt: TimeInterval = 0
+    private var lastWizardTerminalResult: XiangqiWizardTerminalResult?
+    /// Measured from the moment the current trusted position is sent to an
+    /// engine until its candidate is published.  Persisted with executed moves
+    /// so performance regressions are visible in the review timeline.
+    private var lastAnalysisDurationMilliseconds = 0
     private var game = Game()
     private var session: XiangqiSessionRecord?
+    private var restoredSessionForSetup: XiangqiSessionRecord?
 
     init(presentation: PilotPresentationModel = .mock) {
         self.presentation = presentation
@@ -306,6 +342,11 @@ final class PilotRuntime: ObservableObject {
     func bootstrap() async {
         refreshPermissionState()
         await configureIntelligence()
+        // Keep the first actual move responsive.  The client is idempotent and
+        // falls back to the local engine if the bundled binary is unavailable.
+        Task { [pikafishEngine] in
+            try? await pikafishEngine.start()
+        }
         Task { [pricingService] in
             await pricingService.refreshFromOfficialSite()
         }
@@ -388,6 +429,7 @@ final class PilotRuntime: ObservableObject {
     func selectWindow(_ window: CapturableWindow) async {
         isBusy = true
         blockingError = nil
+        lastWizardTerminalResult = nil
         do {
             let target = try await capture.lockWindow(window.windowID)
             selectedBundleIdentifier = window.bundleIdentifier
@@ -506,7 +548,8 @@ final class PilotRuntime: ObservableObject {
             let snapshot = try await recognizer.recognize(
                 image: frame.image,
                 frameSequence: frame.sequence,
-                geometry: geometry
+                geometry: geometry,
+                targetBundleIdentifier: selectedBundleIdentifier
             )
             recognitionWarnings = snapshot.warnings
             recognizedPieceCount = snapshot.localOccupancy.count
@@ -601,14 +644,75 @@ final class PilotRuntime: ObservableObject {
             await analyzeCurrentPosition()
         } catch {
             positionIsTrusted = false
+            // Do not throw away a useful partial recognition merely because it
+            // is not yet a legal Xiangqi position (for example, one general
+            // was obscured by an animation).  Keeping this draft on the
+            // digital board makes the discrepancy visible and lets the user
+            // correct only the bad cells instead of starting from an empty
+            // board.
+            if let snapshot = try? await recognizer.recognize(
+                image: frame.image,
+                frameSequence: frame.sequence,
+                geometry: recognitionGeometry(from: calibration),
+                targetBundleIdentifier: selectedBundleIdentifier
+            ) {
+                recognizedPieceCount = snapshot.localOccupancy.count
+                recognitionWarnings = snapshot.warnings
+                recognitionWarnings.append("无法建立合法局面：\(error.localizedDescription)")
+                recognitionWarnings.append(recognitionDraftSummary(snapshot))
+                synchronizeRecognitionDraft(snapshot)
+            } else {
+                recognitionWarnings = ["无法建立合法局面：\(error.localizedDescription)"]
+            }
             blockingError = "局面识别需要人工确认：\(error.localizedDescription)"
             presentation.confidence = 0
             presentation.confidenceBasis = "识别失败"
-            presentation.phase = .recognizing
+            presentation.phase = .observing
+            presentation.recordEvent(
+                title: "局面识别待校正",
+                detail: "保留已识别棋子草稿；请核对标黄位置",
+                symbolName: "exclamationmark.triangle.fill",
+                tone: .attention
+            )
         }
     }
 
+    /// Shows the recognizer's best-effort board without pretending it is
+    /// trusted. Unknown-side pieces are intentionally omitted: presenting a
+    /// fabricated red/black side is more dangerous than leaving one cell for
+    /// the correction sheet.
+    private func synchronizeRecognitionDraft(_ snapshot: XiangqiRecognitionSnapshot) {
+        presentation.pieces = snapshot.pieces.compactMap { recognized in
+            guard recognized.side != .unknown else { return nil }
+            let side: Side = recognized.side == .red ? .red : .black
+            let kind: PieceKind
+            switch recognized.kind {
+            case .general: kind = .general
+            case .advisor: kind = .advisor
+            case .elephant: kind = .elephant
+            case .horse: kind = .horse
+            case .chariot: kind = .chariot
+            case .cannon: kind = .cannon
+            case .soldier: kind = .soldier
+            }
+            return BoardPiece(
+                side: recognized.side == .red ? .red : .black,
+                character: glyph(for: Piece(side: side, kind: kind)),
+                column: recognized.file,
+                row: recognized.rank
+            )
+        }
+    }
+
+    private func recognitionDraftSummary(_ snapshot: XiangqiRecognitionSnapshot) -> String {
+        let unknownSides = snapshot.pieces.filter { $0.side == .unknown }.count
+        let red = snapshot.pieces.filter { $0.side == .red }.count
+        let black = snapshot.pieces.filter { $0.side == .black }.count
+        return "识别草稿：占位\(snapshot.localOccupancy.count)格，已分类红\(red)黑\(black)，颜色待定\(unknownSides)"
+    }
+
     func useStandardPositionForCorrection() async {
+        restoredSessionForSetup = nil
         game.reset(to: .standard)
         recognitionWarnings = ["已载入标准局面，请根据画面修正"]
         recognizedPieceCount = 32
@@ -617,6 +721,38 @@ final class PilotRuntime: ObservableObject {
         positionIsTrusted = false
         synchronizePresentation(position: game.position)
         await analyzeCurrentPosition()
+    }
+
+    /// Restores the last persisted, rule-valid position for the selected target
+    /// as an explicit correction draft. The user still confirms it against the
+    /// visible board before automation is armed.
+    func restoreLatestSessionForCorrection() async {
+        do {
+            let sessions = try await sessionStore.list()
+            guard let latest = sessions.first(where: { record in
+                record.targetApplicationName == presentation.source.applicationName
+                    || record.targetWindowTitle == presentation.source.windowTitle
+            }) else {
+                blockingError = "没有找到这个目标程序的历史可信局面"
+                return
+            }
+            let position = try Position(fen: latest.currentFEN)
+            game.reset(to: position)
+            restoredSessionForSetup = latest
+            sideToMove = position.sideToMove
+            recognizedPieceCount = position.board.pieceCount()
+            positionIsTrusted = false
+            presentation.confidence = 1
+            presentation.confidenceBasis = "上次已验证局面（等待画面对照确认）"
+            synchronizePresentation(position: position)
+            recognitionWarnings = [
+                "已恢复上次可信记录：\(latest.moves.count)手，更新时间\(latest.updatedAt.formatted(date: .omitted, time: .standard))；请与真实棋盘核对后确认。"
+            ]
+            blockingError = nil
+            statusMessage = "已载入上次可信局面，等待确认"
+        } catch {
+            blockingError = "恢复上次棋局失败：\(error.localizedDescription)"
+        }
     }
 
     func editPiece(at coordinate: BoardCoordinate, side: XiangqiSide?, glyph: String?) {
@@ -647,6 +783,7 @@ final class PilotRuntime: ObservableObject {
             }
             let position = Position(board: board, sideToMove: sideToMove)
             game.reset(to: position)
+            lastWizardTerminalResult = nil
             recognitionWarnings = []
             presentation.confidence = 1
             presentation.confidenceBasis = "人工确认"
@@ -673,6 +810,7 @@ final class PilotRuntime: ObservableObject {
               let calibration,
               let initialFrame = latestCapturedFrame else { return }
 
+        let shouldResumeAfterLocalRecovery = !presentation.isPaused && !presentation.isEmergencyStopped
         analysisTask?.cancel()
         await clickExecutor.pause(.manualTakeover)
         presentation.isPaused = true
@@ -726,11 +864,48 @@ final class PilotRuntime: ObservableObject {
                 throw XiangqiError.invalidFEN("棋盘仍在动画或变化，请画面稳定后重试")
             }
 
+            // Level 1: a stable local delta can explain either one move, or
+            // two consecutive plies when the opponent replied before the
+            // polling loop saw the intermediate frame.  Both paths avoid OCR
+            // and cloud latency completely.
+            if let trustedBoardSignature {
+                let visualChange = boardDifferencer.changes(
+                    from: trustedBoardSignature,
+                    to: signature,
+                    minimumScore: 0.07
+                )
+                if let line = RecognitionTransitionPolicy.decoratedLegalLine(
+                    trusted: game.position,
+                    orientation: orientation,
+                    visualChange: visualChange
+                ) {
+                    try await applyStableLocalRecovery(
+                        moves: line,
+                        signature: signature,
+                        resumeAutomation: shouldResumeAfterLocalRecovery
+                    )
+                    return
+                }
+                if let move = RecognitionTransitionPolicy.decoratedLegalMove(
+                    trusted: game.position,
+                    orientation: orientation,
+                    visualChange: visualChange
+                ) {
+                    try await applyStableLocalRecovery(
+                        moves: [move],
+                        signature: signature,
+                        resumeAutomation: shouldResumeAfterLocalRecovery
+                    )
+                    return
+                }
+            }
+
             presentation.recoveryProgressText = "本地视觉正在识别90个交点"
             let snapshot = try await recognizer.recognize(
                 image: frame.image,
                 frameSequence: frame.sequence,
-                geometry: geometry
+                geometry: geometry,
+                targetBundleIdentifier: selectedBundleIdentifier
             )
             guard snapshot.localOccupancy.count >= 2 else {
                 throw XiangqiError.invalidFEN("当前画面没有足够棋子，疑似棋盘被遮挡；请关闭弹窗后重试")
@@ -822,6 +997,62 @@ final class PilotRuntime: ObservableObject {
         }
     }
 
+    /// Applies an already-stable, uniquely explained visual transition.  No
+    /// OCR or cloud call is involved, and the old trusted board is never
+    /// overwritten by an unclassified image.
+    private func applyStableLocalRecovery(
+        moves: [Move],
+        signature: BoardFrameSignature,
+        resumeAutomation: Bool
+    ) async throws {
+        guard !moves.isEmpty else { return }
+        var recovered: [(move: Move, before: Position, after: Position)] = []
+        for move in moves {
+            let before = game.position
+            _ = try game.play(move)
+            recovered.append((move, before, game.position))
+        }
+        sideToMove = game.position.sideToMove
+        trustedBoardSignature = signature
+        lastReconciledFrameSequence = signature.frameSequence
+        lastTrustedPosition = game.position
+        positionIsTrusted = true
+        recognizedPieceCount = game.position.board.pieceCount()
+        presentation.confidence = 1
+        presentation.confidenceBasis = "稳定合法着法差分"
+        presentation.recoveryNeedsAttention = false
+        presentation.recoveryHasCandidate = false
+        presentation.recoveryProgressText = "已由稳定局部变化自动恢复"
+        recoveryCandidate = nil
+        rejectedChangeKey = nil
+        rejectedChangeFirstSeenAt = nil
+        recoveredOrAttemptedChangeKey = nil
+        pendingObservedMove = nil
+        blockingError = nil
+        synchronizePresentation(position: game.position)
+        for item in recovered {
+            await recordObservedMove(item.move, before: item.before, after: item.after)
+        }
+        presentation.recordEvent(
+            title: "已由稳定局部变化恢复",
+            detail: "\(moves.map(\.ucci).joined(separator: " → ")) · 未调用全盘识别或云端模型",
+            symbolName: "checkmark.shield.fill",
+            tone: .success
+        )
+
+        if resumeAutomation {
+            try await clickExecutor.arm()
+            presentation.isPaused = false
+            presentation.phase = .observing
+            statusMessage = "局部恢复完成，已继续自动监控"
+            await analyzeCurrentPosition()
+        } else {
+            presentation.isPaused = true
+            presentation.phase = .previewing
+            statusMessage = "局部恢复完成，保持暂停等待继续"
+        }
+    }
+
     func applyRecoveryCandidate(automatic: Bool = false) async {
         guard let candidate = recoveryCandidate else { return }
         analysisTask?.cancel()
@@ -898,15 +1129,26 @@ final class PilotRuntime: ObservableObject {
         presentation.isPaused = false
         presentation.phase = .observing
         try? await clickExecutor.arm()
-        let newSession = XiangqiSessionRecord(
-            title: "中国象棋 \(Date().formatted(date: .abbreviated, time: .shortened))",
-            targetApplicationName: presentation.source.applicationName,
-            targetWindowTitle: presentation.source.windowTitle,
-            initialFEN: game.position.fen,
-            currentFEN: game.position.fen
-        )
-        session = newSession
-        try? await sessionStore.save(newSession)
+        if var restored = restoredSessionForSetup,
+           restored.currentFEN == game.position.fen {
+            restored.targetApplicationName = presentation.source.applicationName
+            restored.targetBundleIdentifier = selectedBundleIdentifier
+            restored.targetWindowTitle = presentation.source.windowTitle
+            session = restored
+            try? await sessionStore.save(restored)
+        } else {
+            let newSession = XiangqiSessionRecord(
+                title: "中国象棋 \(Date().formatted(date: .abbreviated, time: .shortened))",
+                targetApplicationName: presentation.source.applicationName,
+                targetBundleIdentifier: selectedBundleIdentifier,
+                targetWindowTitle: presentation.source.windowTitle,
+                initialFEN: game.position.fen,
+                currentFEN: game.position.fen
+            )
+            session = newSession
+            try? await sessionStore.save(newSession)
+        }
+        restoredSessionForSetup = nil
         statusMessage = "象棋视觉驾驶舱已就绪"
         presentation.recordEvent(
             title: "驾驶舱开始实时监控",
@@ -914,11 +1156,13 @@ final class PilotRuntime: ObservableObject {
             symbolName: "waveform.path.ecg",
             tone: .success
         )
+        await analyzeCurrentPosition()
     }
 
     func analyzeCurrentPosition(level: ThinkingLevel = .standard) async {
         analysisTask?.cancel()
         let position = game.position
+        let analysisStartedAt = ProcessInfo.processInfo.systemUptime
         presentation.phase = .thinking
         let selectedEngine = presentation.engineSource
         analysisTask = Task { [weak self] in
@@ -932,6 +1176,9 @@ final class PilotRuntime: ObservableObject {
                     try Task.checkCancellation()
                     guard self.game.position.key == position.key else { return }
                     try self.applyExternalAnalysis(result, position: position)
+                    self.lastAnalysisDurationMilliseconds = Int(
+                        (ProcessInfo.processInfo.systemUptime - analysisStartedAt) * 1_000
+                    )
                     self.statusMessage = "Pikafish 已完成分析"
                 } else {
                     let engine = self.localEngine
@@ -941,6 +1188,9 @@ final class PilotRuntime: ObservableObject {
                     try Task.checkCancellation()
                     guard self.game.position.key == analysis.positionKey else { return }
                     self.applyAnalysis(analysis)
+                    self.lastAnalysisDurationMilliseconds = Int(
+                        (ProcessInfo.processInfo.systemUptime - analysisStartedAt) * 1_000
+                    )
                 }
             } catch is CancellationError {
                 return
@@ -953,6 +1203,9 @@ final class PilotRuntime: ObservableObject {
                     }).value,
                        self.game.position.key == fallback.positionKey {
                         self.applyAnalysis(fallback)
+                        self.lastAnalysisDurationMilliseconds = Int(
+                            (ProcessInfo.processInfo.systemUptime - analysisStartedAt) * 1_000
+                        )
                         return
                     }
                 }
@@ -985,6 +1238,12 @@ final class PilotRuntime: ObservableObject {
 
     private func execute(_ candidate: CandidateMove) async {
         automaticExecutionToken = nil
+        guard !executionInProgress else {
+            statusMessage = "当前落子正在执行，请勿重复确认"
+            return
+        }
+        executionInProgress = true
+        defer { executionInProgress = false }
         guard let move = Move(ucci: candidate.id),
               game.position.legalMoves.contains(move),
               let calibration else {
@@ -1007,13 +1266,12 @@ final class PilotRuntime: ObservableObject {
         let actionStartedAt = ProcessInfo.processInfo.systemUptime
         do {
             presentation.phase = .acting
-            try await clickExecutor.arm()
             let preparationStartedAt = ProcessInfo.processInfo.systemUptime
-            let frame = try await clickExecutor.prepareTargetForInput(
+            let frame = try await prepareTargetForInputWithRetry(
                 ownerPID: target.ownerPID,
                 windowID: target.windowID,
                 calibration: calibration,
-                capture: capture
+                targetName: presentation.source.applicationName
             )
             PilotDiagnosticLogger.timing(
                 "prepare_target",
@@ -1071,30 +1329,94 @@ final class PilotRuntime: ObservableObject {
                 capture: capture
             )
             _ = try game.play(move)
+            let positionAfterExecutedMove = game.position
+            lastAcceptedVisualMoveAt = ProcessInfo.processInfo.systemUptime
             sideToMove = game.position.sideToMove
             // Preserve the exact frame that proved this move. The target may
             // answer immediately; using a later frame here would silently
             // absorb that reply without applying it to the digital position.
             trustedBoardSignature = verification.signature
             lastReconciledFrameSequence = verification.signature.frameSequence
+            if let reply = verification.opponentReply {
+                let beforeReply = game.position
+                _ = try game.play(reply)
+                lastAcceptedVisualMoveAt = ProcessInfo.processInfo.systemUptime
+                sideToMove = game.position.sideToMove
+                await recordObservedMove(reply, before: beforeReply, after: game.position)
+            }
             synchronizePresentation(position: game.position)
-            await recordExecutedMove(move, before: positionBefore, after: game.position)
+            await recordExecutedMove(move, before: positionBefore, after: positionAfterExecutedMove)
             PilotDiagnosticLogger.timing(
                 "confirmed_move_total",
                 milliseconds: (ProcessInfo.processInfo.systemUptime - actionStartedAt) * 1_000
             )
-            statusMessage = "数字棋盘已同步：\(move.ucci)"
+            statusMessage = verification.opponentReply.map {
+                "数字棋盘已连续同步：\(move.ucci) → \($0.ucci)"
+            } ?? "数字棋盘已同步：\(move.ucci)，等待对方应招…"
             presentation.recordEvent(
-                title: "落子执行并验证",
-                detail: "\(move.ucci) · 数字棋盘已同步为\(game.position.board.pieceCount())枚",
+                title: verification.opponentReply == nil ? "落子执行并验证" : "双方着法连续同步",
+                detail: verification.opponentReply.map {
+                    "\(move.ucci) → \($0.ucci) · 目标程序合并刷新"
+                } ?? "\(move.ucci) · 数字棋盘已同步为\(game.position.board.pieceCount())枚",
                 symbolName: "cursorarrow.click.2",
                 tone: .success
             )
-            await analyzeCurrentPosition()
+            // v0.2.0: Do NOT analyze immediately. It is now the opponent's
+            // turn; analyzing would make automatic mode try to play the
+            // opponent's move while the target app is still thinking/animating.
+            // Enter observing mode; reconcileTrustedPosition() will detect the
+            // opponent's response and trigger analysis at that point.
+            presentation.phase = .observing
+            if verification.opponentReply != nil {
+                await analyzeCurrentPosition()
+            }
         } catch {
             let diagnostic = PilotDiagnostic(error: error)
             await clickExecutor.pause(.verificationFailed(diagnostic.displayText))
             pause(reason: diagnostic.displayText)
+        }
+    }
+
+    /// Retries only before any mouse event has been posted.  Once execution
+    /// reaches `ClickExecutor.execute`, a failed verification is treated as an
+    /// uncertain outcome and is never blindly clicked again.
+    private func prepareTargetForInputWithRetry(
+        ownerPID: pid_t,
+        windowID: CGWindowID,
+        calibration: BoardCalibration,
+        targetName: String
+    ) async throws -> CapturedFrame {
+        var latestError: Error?
+        for attempt in 1...3 {
+            do {
+                try await clickExecutor.arm()
+                return try await clickExecutor.prepareTargetForInput(
+                    ownerPID: ownerPID,
+                    windowID: windowID,
+                    calibration: calibration,
+                    capture: capture
+                )
+            } catch {
+                latestError = error
+                guard isRetryablePreflightError(error), attempt < 3 else { throw error }
+                let diagnostic = PilotDiagnostic(error: error)
+                statusMessage = "正在重新激活\(targetName)：\(diagnostic.message)（第\(attempt)次重试）"
+                PilotDiagnosticLogger.event(
+                    "preflight_retry attempt=\(attempt) error=\(diagnostic.code)"
+                )
+                try? await Task.sleep(for: .milliseconds(240 * attempt))
+            }
+        }
+        throw latestError ?? ClickExecutorError.targetWindowMissing
+    }
+
+    private func isRetryablePreflightError(_ error: Error) -> Bool {
+        guard let error = error as? ClickExecutorError else { return false }
+        switch error {
+        case .targetNotFrontmost, .targetWindowOccluded, .frameNotStable:
+            return true
+        default:
+            return false
         }
     }
 
@@ -1103,14 +1425,17 @@ final class PilotRuntime: ObservableObject {
         after sequence: UInt64,
         move: Move,
         beforeBoardSignature: BoardFrameSignature
-    ) async throws -> (position: Position, signature: BoardFrameSignature) {
+    ) async throws -> VerifiedMoveSequence {
         let clock = ContinuousClock()
         // Some target programs animate or think before committing a move. Keep
         // observing long enough to accept that delayed result, but make the hot
         // path cheap: board fingerprints first, OCR only for a settled complex
         // change. This also prevents OCR work from starving the target app.
         let startedAt = clock.now
-        let deadline = startedAt.advanced(by: .seconds(15))
+        // 象棋巫师 may take 16–20 seconds before publishing our move and its
+        // reply together. The previous 15-second deadline expired one frame
+        // before that redraw in a real run.
+        let deadline = startedAt.advanced(by: .seconds(30))
         var lastProcessedSequence = sequence
         var lastChangedSignature: BoardFrameSignature?
         var complexChangeStableSince: ContinuousClock.Instant?
@@ -1142,7 +1467,27 @@ final class PilotRuntime: ObservableObject {
                     PilotDiagnosticLogger.event(
                         "expected_move_detected_directly move=\(move.ucci) frame=\(frame.sequence)"
                     )
-                    return (expected, afterSignature)
+                    return VerifiedMoveSequence(
+                        position: expected,
+                        signature: afterSignature,
+                        opponentReply: nil
+                    )
+                }
+
+                if let reply = RecognitionTransitionPolicy.decoratedLegalReply(
+                    trusted: game.position,
+                    firstMove: move,
+                    orientation: orientation,
+                    visualChange: visualChange
+                ), let afterReply = try? expected.applying(reply) {
+                    PilotDiagnosticLogger.event(
+                        "expected_move_and_reply_detected first=\(move.ucci) reply=\(reply.ucci) frame=\(frame.sequence)"
+                    )
+                    return VerifiedMoveSequence(
+                        position: afterReply,
+                        signature: afterSignature,
+                        opponentReply: reply
+                    )
                 }
 
                 // An unchanged board cannot help OCR verification. Waiting here
@@ -1174,14 +1519,19 @@ final class PilotRuntime: ObservableObject {
                         let snapshot = try await recognizer.recognize(
                             image: frame.image,
                             frameSequence: frame.sequence,
-                            geometry: geometry
+                            geometry: geometry,
+                            targetBundleIdentifier: selectedBundleIdentifier
                         )
                         if let observed = try? makePosition(from: snapshot),
                            PositionVerificationPolicy.matches(observed: observed, expected: expected) {
                             PilotDiagnosticLogger.event(
                                 "expected_move_detected_by_ocr move=\(move.ucci) frame=\(frame.sequence)"
                             )
-                            return (expected, afterSignature)
+                            return VerifiedMoveSequence(
+                                position: expected,
+                                signature: afterSignature,
+                                opponentReply: nil
+                            )
                         }
                         if PositionVerificationPolicy.matches(
                             snapshot: snapshot,
@@ -1193,7 +1543,11 @@ final class PilotRuntime: ObservableObject {
                             PilotDiagnosticLogger.event(
                                 "expected_move_detected_by_partial_ocr move=\(move.ucci) frame=\(frame.sequence)"
                             )
-                            return (expected, afterSignature)
+                            return VerifiedMoveSequence(
+                                position: expected,
+                                signature: afterSignature,
+                                opponentReply: nil
+                            )
                         }
                     }
                 }
@@ -1206,7 +1560,7 @@ final class PilotRuntime: ObservableObject {
             }
             try await Task.sleep(for: .milliseconds(35))
         }
-        PilotDiagnosticLogger.event("target_response_timeout_15_seconds move=\(move.ucci)")
+        PilotDiagnosticLogger.event("target_response_timeout_30_seconds move=\(move.ucci)")
         throw ClickExecutorError.verificationBoardStateUnchanged
     }
 
@@ -1412,21 +1766,24 @@ final class PilotRuntime: ObservableObject {
                 }
 
                 game.reset(to: position)
-                positionIsTrusted = true
+                // A single visual model can return a legal but visually wrong
+                // FEN. Keep its result as a correction draft; only the user or
+                // independent evidence may establish the first trusted board.
+                positionIsTrusted = false
                 recognizedPieceCount = position.board.pieceCount()
-                trustedBoardSignature = latestSignature
+                trustedBoardSignature = nil
                 presentation.confidence = response.confidence
-                presentation.confidenceBasis = attempt.label
+                presentation.confidenceBasis = "\(attempt.label)（等待确认）"
                 synchronizePresentation(position: position)
                 recognitionWarnings = response.warnings + [
-                    "已由\(attempt.label)复核；允许补回\(modelOnlyCells.count)个本地漏检交点，并通过FEN、棋子上限与双将校验"
+                    "\(attempt.label)已生成合法局面草稿；模型结果不能单独建立可信基准，请与真实棋盘核对。"
                 ]
-                statusMessage = "\(attempt.label)已确认\(recognizedPieceCount)枚局面"
+                statusMessage = "\(attempt.label)已生成\(recognizedPieceCount)枚局面草稿，等待确认"
                 presentation.recordEvent(
-                    title: "云端局面识别可信",
+                    title: "云端局面等待人工确认",
                     detail: "\(attempt.label) · \(recognizedPieceCount)枚 · 置信度\(Int(response.confidence * 100))%",
-                    symbolName: "checkmark.seal.fill",
-                    tone: .success
+                    symbolName: "exclamationmark.triangle.fill",
+                    tone: .attention
                 )
                 return true
             } catch {
@@ -1873,6 +2230,26 @@ final class PilotRuntime: ObservableObject {
               frame.sequence > lastReconciledFrameSequence,
               let calibration,
               let trustedBoardSignature else { return }
+        if selectedBundleIdentifier == XiangqiWizardMoveLogReader.bundleIdentifier,
+           lastWizardTerminalResult == nil,
+           let terminalResult = XiangqiWizardMoveLogReader.terminalResult(
+            ownerPID: frame.target.ownerPID
+           ) {
+            handleWizardTerminalResult(terminalResult)
+            return
+        }
+        // 象棋巫师 substantially dims every piece when its window loses
+        // foreground focus. Comparing that inactive rendering with an active
+        // trusted frame produces roughly 30 simultaneous changed cells and
+        // looks like a catastrophic board mutation. A real GUI move can only
+        // be made while the locked target is frontmost, so inactive frames are
+        // display-only and must never advance or invalidate the digital board.
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == frame.target.ownerPID else {
+            pendingObservedMove = nil
+            rejectedChangeKey = nil
+            rejectedChangeFirstSeenAt = nil
+            return
+        }
         switch presentation.phase {
         case .acting, .verifying, .recognizing:
             return
@@ -1891,6 +2268,71 @@ final class PilotRuntime: ObservableObject {
             to: signature,
             minimumScore: 0.07
         )
+
+        // The move row and board animation are not committed in the same
+        // render transaction. Check 象棋巫师's exact next record on every
+        // observation frame, before classifying the pixel delta as unchanged,
+        // decorated, or rejected. The ply index prevents stale rows from being
+        // replayed, and the local rules engine must resolve the notation to one
+        // and only one legal move.
+        let isWizardTarget = selectedBundleIdentifier == XiangqiWizardMoveLogReader.bundleIdentifier
+        let observationUptime = ProcessInfo.processInfo.systemUptime
+        let wizardRecordedMove: Move? = if isWizardTarget {
+            XiangqiWizardMoveLogReader.latestLegalMove(
+                ownerPID: frame.target.ownerPID,
+                expectedPlyIndex: game.records.count,
+                position: game.position
+            ) ?? (observationUptime - lastWizardMoveOCRAttemptAt >= 0.25
+                ? {
+                    lastWizardMoveOCRAttemptAt = observationUptime
+                    return XiangqiWizardMoveLogReader.latestLegalMove(
+                    image: frame.image,
+                    expectedPlyIndex: game.records.count,
+                    position: game.position
+                    )
+                }()
+                : nil)
+        } else {
+            nil
+        }
+        if let recordedMove = wizardRecordedMove {
+            let before = game.position
+            do {
+                analysisTask?.cancel()
+                _ = try game.play(recordedMove)
+                lastAcceptedVisualMoveAt = ProcessInfo.processInfo.systemUptime
+                sideToMove = game.position.sideToMove
+                self.trustedBoardSignature = signature
+                pendingObservedMove = nil
+                rejectedChangeKey = nil
+                rejectedChangeFirstSeenAt = nil
+                recoveredOrAttemptedChangeKey = nil
+                presentation.confidence = 1
+                presentation.confidenceBasis = "象棋巫师走棋记录＋本地棋规"
+                synchronizePresentation(position: game.position)
+                statusMessage = "数字棋盘已由确定性记录同步：\(recordedMove.ucci)"
+                PilotDiagnosticLogger.event(
+                    "wizard_move_log_confirmed move=\(recordedMove.ucci) ply=\(game.records.count)"
+                )
+                Task { [weak self] in
+                    guard let self else { return }
+                    await self.recordObservedMove(recordedMove, before: before, after: self.game.position)
+                    await self.analyzeCurrentPosition()
+                }
+                return
+            } catch {
+                blockingError = "走棋记录同步失败：\(error.localizedDescription)"
+                return
+            }
+        }
+        // 象棋巫师's board highlight can briefly look exactly like a different
+        // legal two-endpoint move before its official row is committed. Never
+        // let that animation race the authoritative next-ply record. Generic
+        // windows and web boards continue through the visual policy below.
+        if isWizardTarget {
+            statusMessage = "等待象棋巫师发布第\(game.records.count + 1)步官方记录…"
+            return
+        }
         switch RecognitionTransitionPolicy.decide(
             trusted: game.position,
             orientation: orientation,
@@ -1898,6 +2340,7 @@ final class PilotRuntime: ObservableObject {
         ) {
         case .unchanged:
             self.trustedBoardSignature = signature
+            pendingObservedMove = nil
             rejectedChangeKey = nil
             rejectedChangeFirstSeenAt = nil
             recoveredOrAttemptedChangeKey = nil
@@ -1906,6 +2349,7 @@ final class PilotRuntime: ObservableObject {
             do {
                 analysisTask?.cancel()
                 _ = try game.play(move)
+                lastAcceptedVisualMoveAt = ProcessInfo.processInfo.systemUptime
                 sideToMove = game.position.sideToMove
                 self.trustedBoardSignature = signature
                 rejectedChangeKey = nil
@@ -1924,6 +2368,60 @@ final class PilotRuntime: ObservableObject {
                 blockingError = "实时棋盘同步失败：\(error.localizedDescription)"
             }
         case .rejected:
+            let now = ProcessInfo.processInfo.systemUptime
+            if let decoratedMove = RecognitionTransitionPolicy.decoratedLegalMove(
+                trusted: game.position,
+                orientation: orientation,
+                visualChange: visualChange
+            ) {
+                if var pending = pendingObservedMove,
+                   pending.move == decoratedMove,
+                   // Capture normally runs at 20 Hz, but foreground handoff,
+                   // animation and engine callbacks can delay a main-actor
+                   // reconciliation frame well beyond 120 ms. Keep the same
+                   // uniquely legal candidate alive across that scheduling
+                   // gap while still requiring repeated stable evidence.
+                   now - pending.lastSeenAt <= 0.80 {
+                    pending.lastSeenAt = now
+                    pendingObservedMove = pending
+                    if now - pending.firstSeenAt >= 0.18 {
+                        let before = game.position
+                        do {
+                            analysisTask?.cancel()
+                            _ = try game.play(decoratedMove)
+                            lastAcceptedVisualMoveAt = ProcessInfo.processInfo.systemUptime
+                            sideToMove = game.position.sideToMove
+                            self.trustedBoardSignature = signature
+                            pendingObservedMove = nil
+                            rejectedChangeKey = nil
+                            rejectedChangeFirstSeenAt = nil
+                            recoveredOrAttemptedChangeKey = nil
+                            presentation.confidence = 1
+                            presentation.confidenceBasis = "合法着法差分（已过滤高亮）"
+                            synchronizePresentation(position: game.position)
+                            statusMessage = "数字棋盘已实时同步：\(decoratedMove.ucci)"
+                            Task { [weak self] in
+                                guard let self else { return }
+                                await self.recordObservedMove(decoratedMove, before: before, after: self.game.position)
+                                await self.analyzeCurrentPosition()
+                            }
+                            return
+                        } catch {
+                            pendingObservedMove = nil
+                            blockingError = "实时棋盘同步失败：\(error.localizedDescription)"
+                            return
+                        }
+                    }
+                    return
+                }
+                pendingObservedMove = PendingObservedMove(
+                    move: decoratedMove,
+                    firstSeenAt: now,
+                    lastSeenAt: now
+                )
+                return
+            }
+            pendingObservedMove = nil
             // Highlights and animations are usually brief. Only a stable,
             // repeated unexplained pattern enters recovery, so one transient
             // frame can never invoke AI or replace the trusted board.
@@ -1931,7 +2429,29 @@ final class PilotRuntime: ObservableObject {
                 .map { "\($0.coordinate.file),\($0.coordinate.rank)" }
                 .sorted()
                 .joined(separator: ";")
-            let now = ProcessInfo.processInfo.systemUptime
+            // After a legal move, 象棋巫师 can remove one corner of its blue
+            // last-move marker several frames later. A single changed cell can
+            // never prove a Xiangqi move. Wait until that exact decoration is
+            // stable, then rebase only the visual signature; do not touch the
+            // digital position and do not invoke the cloud recovery path.
+            if visualChange.cells.count == 1,
+               let lastAcceptedVisualMoveAt,
+               now - lastAcceptedVisualMoveAt <= 3.0 {
+                if rejectedChangeKey != key {
+                    rejectedChangeKey = key
+                    rejectedChangeFirstSeenAt = now
+                    return
+                }
+                if let firstSeen = rejectedChangeFirstSeenAt,
+                   now - firstSeen >= 0.25 {
+                    self.trustedBoardSignature = signature
+                    rejectedChangeKey = nil
+                    rejectedChangeFirstSeenAt = nil
+                    recoveredOrAttemptedChangeKey = nil
+                    PilotDiagnosticLogger.event("single_cell_decoration_rebased cell=\(key)")
+                }
+                return
+            }
             if rejectedChangeKey != key {
                 rejectedChangeKey = key
                 rejectedChangeFirstSeenAt = now
@@ -1955,6 +2475,31 @@ final class PilotRuntime: ObservableObject {
             recoveryTask = Task { [weak self] in
                 await self?.beginPositionRecovery()
             }
+        }
+    }
+
+    private func handleWizardTerminalResult(_ result: XiangqiWizardTerminalResult) {
+        lastWizardTerminalResult = result
+        analysisTask?.cancel()
+        automaticExecutionToken = nil
+        executionInProgress = false
+        presentation.candidates = [.unavailable]
+        presentation.selectedCandidateID = CandidateMove.unavailable.id
+        presentation.phase = .observing
+        presentation.isPaused = true
+        presentation.confidence = 1
+        presentation.confidenceBasis = "象棋巫师终局公告"
+        blockingError = nil
+        statusMessage = "对局结束：(result.title)"
+        presentation.recordEvent(
+            title: "对局结束·(result.title)",
+            detail: "已由象棋巫师的终局弹窗确认，窗口操作已自动锁定",
+            symbolName: result == .win ? "trophy.fill" : "flag.checkered",
+            tone: result == .win ? .success : (result == .draw ? .neutral : .attention)
+        )
+        Task { [weak self] in
+            guard let self else { return }
+            await self.clickExecutor.pause(.userRequested)
         }
     }
 
@@ -2043,9 +2588,9 @@ final class PilotRuntime: ObservableObject {
             fenBefore: before.fen,
             move: move.ucci,
             fenAfter: after.fen,
-            source: .localEngine,
+            source: presentation.engineSource == .ucci ? .ucciEngine : .localEngine,
             confidence: presentation.confidence,
-            thinkingMilliseconds: 0,
+            thinkingMilliseconds: lastAnalysisDurationMilliseconds,
             outcome: .executed
         ))
         session = current

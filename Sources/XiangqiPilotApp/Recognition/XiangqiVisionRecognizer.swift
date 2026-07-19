@@ -1,6 +1,7 @@
 import CoreGraphics
 import CoreImage
 import Foundation
+import ImageIO
 import Vision
 
 enum RecognizedSide: String, Codable, Sendable { case red, black, unknown }
@@ -59,6 +60,151 @@ struct XiangqiRecognitionSnapshot: Codable, Sendable {
         !pieces.contains(where: { $0.side == .unknown }) &&
         pieces.contains(where: { $0.kind == .general && $0.side == .red }) &&
         pieces.contains(where: { $0.kind == .general && $0.side == .black })
+    }
+}
+
+/// The installed iPhone/iPad edition of 象棋巫师 renders its pieces from these
+/// local PNGs.  We never copy or distribute them: when that exact application
+/// is selected, they are used in-memory only to disambiguate OCR on occupied
+/// intersections.  Other applications continue to use the generic recognizer.
+private final class XQWizardTemplateLibrary: @unchecked Sendable {
+    private struct Template {
+        let side: RecognizedSide
+        let kind: RecognizedPieceKind
+        let pixels: [UInt8]
+    }
+
+    private let sampleSize = 24
+    private lazy var templates: [Template] = loadTemplates()
+
+    func recognize(
+        image: CGImage,
+        geometry: RecognitionBoardGeometry,
+        occupied: Set<BoardCellCoordinate>
+    ) -> [RecognizedPiece] {
+        guard !templates.isEmpty else { return [] }
+        let width = CGFloat(image.width)
+        let height = CGFloat(image.height)
+        let horizontalSpacing = max(4, geometry.boundingBox.width * width / 8)
+        let verticalSpacing = max(4, geometry.boundingBox.height * height / 9)
+        let halfSize = min(horizontalSpacing, verticalSpacing) * 0.43
+        let bounds = CGRect(x: 0, y: 0, width: width, height: height)
+        var results: [RecognizedPiece] = []
+
+        for rank in 0..<10 {
+            for file in 0..<9 {
+                let point = geometry.intersectionPoint(file: file, rank: rank)
+                let center = CGPoint(x: point.x * width, y: (1 - point.y) * height)
+                let crop = CGRect(
+                    x: center.x - halfSize,
+                    y: center.y - halfSize,
+                    width: halfSize * 2,
+                    height: halfSize * 2
+                ).intersection(bounds).integral
+                guard let cellPixels = sample(image: image, crop: crop) else { continue }
+                let ranked = templates.compactMap { template -> (Template, Double)? in
+                    let distance = maskedDistance(template: template.pixels, candidate: cellPixels)
+                    return distance.isFinite ? (template, distance) : nil
+                }.sorted { $0.1 < $1.1 }
+                guard let best = ranked.first else { continue }
+                let margin = (ranked.dropFirst().first?.1 ?? 1) - best.1
+                let coordinate = BoardCellCoordinate(file: file, rank: rank)
+                // An already occupied cell needs only a good glyph match.  An
+                // otherwise empty cell needs a much stronger, clearly unique
+                // match so a board-line pattern can never invent a piece.
+                let isOccupied = occupied.contains(coordinate)
+                let accepted = isOccupied
+                    ? best.1 <= 0.30 && margin >= 0.018
+                    : best.1 <= 0.16 && margin >= 0.075
+                guard accepted else { continue }
+                let confidence = max(0.58, min(0.97, 1 - best.1 / (isOccupied ? 0.42 : 0.24)))
+                results.append(RecognizedPiece(
+                    file: file,
+                    rank: rank,
+                    side: best.0.side,
+                    kind: best.0.kind,
+                    confidence: confidence,
+                    glyph: glyph(for: best.0.kind, side: best.0.side)
+                ))
+            }
+        }
+        return results
+    }
+
+    private func loadTemplates() -> [Template] {
+        let root = URL(fileURLWithPath: "/Applications/象棋巫师.app/Wrapper/XQWizard.app", isDirectory: true)
+        let definitions: [(String, RecognizedPieceKind)] = [
+            ("k", .general), ("a", .advisor), ("b", .elephant),
+            ("n", .horse), ("r", .chariot), ("c", .cannon),
+            ("p", .soldier)
+        ]
+        return [RecognizedSide.black, .red].flatMap { side in
+            let prefix = side == .black ? "b" : "r"
+            return definitions.compactMap { definition -> Template? in
+                let (suffix, kind) = definition
+                let url = root.appendingPathComponent("\(prefix)\(suffix)@2x.png")
+                guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+                      let image = CGImageSourceCreateImageAtIndex(source, 0, nil),
+                      let pixels = sample(image: image, crop: CGRect(x: 0, y: 0, width: image.width, height: image.height)) else {
+                    return nil
+                }
+                return Template(side: side, kind: kind, pixels: pixels)
+            }
+        }
+    }
+
+    private func sample(image: CGImage, crop: CGRect) -> [UInt8]? {
+        guard !crop.isNull, crop.width > 4, crop.height > 4,
+              let source = image.cropping(to: crop) else { return nil }
+        var rgba = [UInt8](repeating: 0, count: sampleSize * sampleSize * 4)
+        guard let context = CGContext(
+            data: &rgba,
+            width: sampleSize,
+            height: sampleSize,
+            bitsPerComponent: 8,
+            bytesPerRow: sampleSize * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+        context.interpolationQuality = .high
+        context.clear(CGRect(x: 0, y: 0, width: sampleSize, height: sampleSize))
+        context.draw(source, in: CGRect(x: 0, y: 0, width: sampleSize, height: sampleSize))
+        return rgba
+    }
+
+    private func maskedDistance(template: [UInt8], candidate: [UInt8]) -> Double {
+        guard template.count == candidate.count else { return .infinity }
+        var total = 0.0
+        var weight = 0.0
+        for offset in stride(from: 0, to: template.count, by: 4) {
+            let alpha = Double(template[offset + 3]) / 255
+            guard alpha > 0.12 else { continue }
+            let dr = Double(template[offset]) - Double(candidate[offset])
+            let dg = Double(template[offset + 1]) - Double(candidate[offset + 1])
+            let db = Double(template[offset + 2]) - Double(candidate[offset + 2])
+            total += (dr * dr + dg * dg + db * db) * alpha
+            weight += 3 * alpha
+        }
+        guard weight > 1 else { return .infinity }
+        return sqrt(total / weight) / 255
+    }
+
+    private func glyph(for kind: RecognizedPieceKind, side: RecognizedSide) -> String {
+        switch (kind, side) {
+        case (.general, .red): return "帥"
+        case (.general, .black): return "將"
+        case (.advisor, .red): return "仕"
+        case (.advisor, .black): return "士"
+        case (.elephant, .red): return "相"
+        case (.elephant, .black): return "象"
+        case (.horse, _): return "馬"
+        case (.chariot, _): return "車"
+        case (.cannon, .red): return "炮"
+        case (.cannon, .black): return "砲"
+        case (.soldier, .red): return "兵"
+        case (.soldier, .black): return "卒"
+        default: return "?"
+        }
     }
 }
 
@@ -155,11 +301,13 @@ final class XiangqiVisionRecognizer: @unchecked Sendable {
         "馬", "马", "傌", "車", "车", "俥", "炮", "砲",
         "車馬象士將士象馬車", "車馬相仕帥仕相馬車"
     ]
+    private let xqWizardTemplates = XQWizardTemplateLibrary()
 
     func recognize(
         image: CGImage,
         frameSequence: UInt64,
-        geometry: RecognitionBoardGeometry
+        geometry: RecognitionBoardGeometry,
+        targetBundleIdentifier: String? = nil
     ) async throws -> XiangqiRecognitionSnapshot {
         try await withCheckedThrowingContinuation { continuation in
             visionQueue.async { [self] in
@@ -167,7 +315,8 @@ final class XiangqiVisionRecognizer: @unchecked Sendable {
                     continuation.resume(returning: try recognizeSync(
                         image: image,
                         frameSequence: frameSequence,
-                        geometry: geometry
+                        geometry: geometry,
+                        targetBundleIdentifier: targetBundleIdentifier
                     ))
                 } catch {
                     continuation.resume(throwing: error)
@@ -179,7 +328,8 @@ final class XiangqiVisionRecognizer: @unchecked Sendable {
     private func recognizeSync(
         image: CGImage,
         frameSequence: UInt64,
-        geometry: RecognitionBoardGeometry
+        geometry: RecognitionBoardGeometry,
+        targetBundleIdentifier: String?
     ) throws -> XiangqiRecognitionSnapshot {
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
@@ -259,6 +409,18 @@ final class XiangqiVisionRecognizer: @unchecked Sendable {
         // That was the source of a false red 兵 at the empty top-right corner
         // in 象棋巫师.
         let detectedOccupancy = detectOccupiedIntersections(image: image, geometry: geometry)
+        if targetBundleIdentifier == "com.jpcxc.xqwiphone" {
+            for piece in xqWizardTemplates.recognize(
+                image: image,
+                geometry: geometry,
+                occupied: detectedOccupancy
+            ) {
+                let key = piece.rank * 9 + piece.file
+                if byCell[key] == nil || byCell[key]!.confidence < piece.confidence {
+                    byCell[key] = piece
+                }
+            }
+        }
         for piece in inferRepeatedPieceTemplates(
             image: image,
             geometry: geometry,
