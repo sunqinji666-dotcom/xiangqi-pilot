@@ -20,6 +20,20 @@ swift build -c release --disable-sandbox
 mkdir -p "$macos_dir" "$contents_dir/Resources"
 install -m 755 ".build/arm64-apple-macosx/release/XiangqiPilot" "$macos_dir/XiangqiPilot"
 install -m 644 "Packaging/Info.plist" "$contents_dir/Info.plist"
+install -m 644 "THIRD_PARTY_NOTICES.md" "$contents_dir/Resources/THIRD_PARTY_NOTICES.md"
+
+pikafish_source="$project_root/Vendor/Pikafish"
+pikafish_destination="$contents_dir/Resources/Engines"
+if [[ -x "$pikafish_source/pikafish" ]]; then
+    mkdir -p "$pikafish_destination"
+    install -m 755 "$pikafish_source/pikafish" "$pikafish_destination/pikafish"
+    for network in "$pikafish_source"/*.nnue(N); do
+        install -m 644 "$network" "$pikafish_destination/${network:t}"
+    done
+    for notice in "$pikafish_source/Copying.txt" "$pikafish_source/NNUE-License.md"; do
+        [[ -f "$notice" ]] && install -m 644 "$notice" "$pikafish_destination/${notice:t}"
+    done
+fi
 
 identity_hash="$(
     security find-identity -v -p codesigning 2>/dev/null \
@@ -33,6 +47,15 @@ if [[ -z "$identity_hash" ]]; then
 fi
 
 designated_requirement="identifier \"$bundle_identifier\" and certificate leaf = H\"$identity_hash\""
+
+if [[ -x "$pikafish_destination/pikafish" ]]; then
+    codesign \
+        --force \
+        --sign "$identity_hash" \
+        --options runtime \
+        --timestamp=none \
+        "$pikafish_destination/pikafish"
+fi
 
 codesign \
     --force \

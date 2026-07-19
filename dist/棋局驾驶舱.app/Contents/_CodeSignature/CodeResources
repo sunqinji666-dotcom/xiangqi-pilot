@@ -3,9 +3,66 @@
 <plist version="1.0">
 <dict>
 	<key>files</key>
-	<dict/>
+	<dict>
+		<key>Resources/Engines/Copying.txt</key>
+		<data>
+		MaPUYLs8fZiEUYfHFqMNuBxEthU=
+		</data>
+		<key>Resources/Engines/NNUE-License.md</key>
+		<data>
+		08+esuJwD4cuTg5ISATZ/Ts+65g=
+		</data>
+		<key>Resources/Engines/pikafish</key>
+		<data>
+		aqjlKhE7kn5cMcjhNv0kZOlkel8=
+		</data>
+		<key>Resources/Engines/pikafish.nnue</key>
+		<data>
+		pK83T67GtVcG8Z4O0y0hj2ogs/Y=
+		</data>
+		<key>Resources/THIRD_PARTY_NOTICES.md</key>
+		<data>
+		JDttN2RXMY/gw82MSrb+0GXNjhw=
+		</data>
+	</dict>
 	<key>files2</key>
-	<dict/>
+	<dict>
+		<key>Resources/Engines/Copying.txt</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			OXLcl0T2SZ8Pmy2/dmlvKuetivmyPd5m1q+Gyd+zaYY=
+			</data>
+		</dict>
+		<key>Resources/Engines/NNUE-License.md</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			gvTlQBHXtJ6H2uOhQwX0zk/tAeYF7Bqo0yyCvNOHzXU=
+			</data>
+		</dict>
+		<key>Resources/Engines/pikafish</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			tTmQZBphVckUA4S9X+fiplbqQq6tG3SqqHHvDGbMt68=
+			</data>
+		</dict>
+		<key>Resources/Engines/pikafish.nnue</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			xAJjcNdRbZsPZoRH+coZMSQVOL3Gic3m/sapkaxNX3c=
+			</data>
+		</dict>
+		<key>Resources/THIRD_PARTY_NOTICES.md</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			OWYQrk1Q4DvQ3knEbjCgDpWCAX54Dsw2kBGGvw2ogcg=
+			</data>
+		</dict>
+	</dict>
 	<key>rules</key>
 	<dict>
 		<key>^Resources/</key>

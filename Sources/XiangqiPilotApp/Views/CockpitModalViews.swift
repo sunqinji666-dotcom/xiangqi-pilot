@@ -303,10 +303,10 @@ struct RecoverySheet: View {
                         .frame(width: 48, height: 48)
 
                         VStack(alignment: .leading, spacing: 3) {
-                            Text("检测到一次画面遮挡")
+                            Text(model.recoveryReason)
                                 .font(.system(size: 16, weight: .bold))
                                 .foregroundStyle(CockpitPalette.primaryText)
-                            Text("19:39:08 · 系统已暂停，未执行重复点击")
+                            Text("\(detectedTime) · 窗口操作已锁定，不会继续自动点击")
                                 .font(.system(size: 10, weight: .medium))
                                 .foregroundStyle(CockpitPalette.secondaryText)
                         }
@@ -317,14 +317,25 @@ struct RecoverySheet: View {
                     .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
 
                     HStack(spacing: 10) {
-                        snapshotCard(title: "最后可信局面", detail: "19:39:07 · 32 枚", color: CockpitPalette.green)
+                        snapshotCard(
+                            title: "最后可信局面",
+                            detail: "\(model.lastTrustedPieceCount) 枚",
+                            color: CockpitPalette.green
+                        )
                         Image(systemName: "arrow.right")
                             .foregroundStyle(CockpitPalette.tertiaryText)
-                        snapshotCard(title: "当前画面", detail: "遮挡已移除", color: CockpitPalette.blue)
+                        snapshotCard(
+                            title: "纠错候选",
+                            detail: model.recoveryCandidatePieceCount.map { "\($0) 枚" }
+                                ?? (model.isRecovering ? "识别中…" : "尚未生成"),
+                            color: model.recoveryHasCandidate ? CockpitPalette.blue : CockpitPalette.amber
+                        )
                     }
 
                     XiangqiBoardView(
-                        pieces: model.pieces,
+                        pieces: model.recoveryCandidatePieces.isEmpty
+                            ? model.pieces
+                            : model.recoveryCandidatePieces,
                         proposal: nil,
                         showsRecognitionOverlay: true,
                         compact: true
@@ -337,11 +348,35 @@ struct RecoverySheet: View {
 
                 VStack(alignment: .leading, spacing: 12) {
                     SectionLabel(title: "恢复检查")
-                    recoveryCheck("目标窗口", detail: "已重新锁定", isComplete: true)
-                    recoveryCheck("棋盘边界", detail: "偏差 0.6 px", isComplete: true)
-                    recoveryCheck("棋子局面", detail: "32 枚一致", isComplete: true)
-                    recoveryCheck("当前轮次", detail: "红方走", isComplete: true)
-                    recoveryCheck("窗口操作", detail: "仍保持锁定", isComplete: false)
+                    recoveryCheck("目标窗口", detail: model.source.isLocked ? "已锁定" : "未锁定", isComplete: model.source.isLocked)
+                    recoveryCheck(
+                        "恢复进度",
+                        detail: model.recoveryProgressText,
+                        isComplete: !model.isRecovering
+                    )
+                    recoveryCheck(
+                        "识别来源",
+                        detail: model.recoverySource?.rawValue ?? "尚无可信候选",
+                        isComplete: model.recoveryHasCandidate
+                    )
+                    recoveryCheck(
+                        "识别置信度",
+                        detail: model.recoveryConfidence.map { $0.formatted(.percent.precision(.fractionLength(1))) } ?? "未取得",
+                        isComplete: model.recoveryConfidence != nil
+                    )
+                    recoveryCheck("窗口操作", detail: "保持锁定，应用后仍暂停", isComplete: false)
+
+                    if model.recoveryHasCandidate {
+                        Picker("下一手", selection: Binding(
+                            get: { model.recoveryCandidateSideToMove ?? model.sideToMove },
+                            set: { model.recoveryCandidateSideToMove = $0 }
+                        )) {
+                            Text("红方走").tag(XiangqiSide.red)
+                            Text("黑方走").tag(XiangqiSide.black)
+                        }
+                        .pickerStyle(.segmented)
+                        .help("棋盘画面通常不包含轮次信息；如果监控期间漏了多步，请在应用前确认下一手方")
+                    }
 
                     Divider().overlay(CockpitPalette.border)
 
@@ -349,7 +384,7 @@ struct RecoverySheet: View {
                         Text("恢复策略")
                             .font(.system(size: 11, weight: .semibold))
                             .foregroundStyle(CockpitPalette.primaryText)
-                        Text("使用当前画面重新识别，并将结果与最后可信局面比较。恢复后保持暂停，由你手动继续。")
+                        Text(recoveryStrategyText)
                             .font(.system(size: 10, weight: .medium))
                             .foregroundStyle(CockpitPalette.secondaryText)
                             .fixedSize(horizontal: false, vertical: true)
@@ -358,24 +393,42 @@ struct RecoverySheet: View {
                     .background(Color.white.opacity(0.035))
                     .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
 
-                    Spacer()
+                    if !model.recoveryDifferences.isEmpty {
+                        SectionLabel(title: "与最后可信局面的差异（\(model.recoveryDifferences.count)）")
+                        ScrollView {
+                            LazyVStack(alignment: .leading, spacing: 6) {
+                                ForEach(model.recoveryDifferences) { difference in
+                                    Text(difference.detail)
+                                        .font(.system(size: 9, weight: .medium, design: .monospaced))
+                                        .foregroundStyle(CockpitPalette.secondaryText)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                }
+                            }
+                        }
+                        .frame(maxHeight: 110)
+                    }
+
+                    Spacer(minLength: 8)
 
                     Button {
-                        model.recognizePosition()
+                        model.beginRecovery()
                     } label: {
-                        Label("重新识别当前画面", systemImage: "viewfinder")
+                        Label(model.isRecovering ? "正在重新识别…" : "AI重新识别当前画面", systemImage: "viewfinder")
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(SecondaryActionButtonStyle())
+                    .disabled(model.isRecovering || !model.source.isLocked)
 
                     Button {
                         model.markRecovered()
                         dismiss()
                     } label: {
-                        Label("设为可信局面并恢复", systemImage: "checkmark.shield.fill")
+                        Label("应用纠正并保持暂停", systemImage: "checkmark.shield.fill")
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(CockpitActionButtonStyle(color: CockpitPalette.green))
+                    .disabled(!model.recoveryHasCandidate || model.isRecovering)
+                    .opacity(model.recoveryHasCandidate && !model.isRecovering ? 1 : 0.45)
                 }
                 .padding(14)
                 .frame(width: 300)
@@ -385,10 +438,13 @@ struct RecoverySheet: View {
             .padding(18)
 
             ModalFooter {
-                Button("关闭并保持暂停") { dismiss() }
+                Button("取消候选，保留旧局面") {
+                    model.discardRecovery()
+                    dismiss()
+                }
                     .buttonStyle(SecondaryActionButtonStyle())
                 Spacer()
-                Text("未知弹窗不会被自动点击")
+                Text("只有本地视觉与AI一致，或双模型一致，才允许自动纠正")
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(CockpitPalette.amber)
             }
@@ -396,6 +452,20 @@ struct RecoverySheet: View {
         .frame(width: 900, height: 680)
         .background(CockpitPalette.canvas)
         .preferredColorScheme(.dark)
+    }
+
+    private var detectedTime: String {
+        model.recoveryDetectedAt?.formatted(date: .omitted, time: .standard) ?? "未记录时间"
+    }
+
+    private var recoveryStrategyText: String {
+        if model.recoveryCanAutoApply {
+            return "本地占位、棋子分类与独立复核一致，满足自动纠正门槛。应用后仍保持暂停，由你确认再继续。"
+        }
+        if model.recoveryHasCandidate {
+            return "候选已通过棋子数量、双方将帅、占位集合和画面稳定校验，但证据尚不足以自动覆盖，请核对差异。"
+        }
+        return "先重新抓取稳定整盘。本地视觉负责占位，千问识别颜色和种类；未通过安全校验时绝不覆盖旧局面。"
     }
 
     private func snapshotCard(title: String, detail: String, color: Color) -> some View {

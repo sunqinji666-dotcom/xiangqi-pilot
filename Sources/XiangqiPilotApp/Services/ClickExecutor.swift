@@ -1,4 +1,5 @@
 import AppKit
+import ApplicationServices
 import CoreGraphics
 import Foundation
 
@@ -28,14 +29,22 @@ enum AutomationControlState: Sendable, Equatable {
     case manualTakeover
 }
 
+enum TargetActivationRoute: Sendable, Equatable {
+    case alreadyFrontmost
+    case cooperative
+    case direct
+}
+
 /// Immutable precondition token created from the exact stable frame used by the
 /// recognizer/engine. A newer frame may still be accepted only when its cheap
 /// visual fingerprint is unchanged and it is within `maximumFrameAdvance`.
-struct ClickActionBinding: Hashable, Sendable {
+struct ClickActionBinding: Sendable {
     let ownerPID: pid_t
     let windowID: CGWindowID
     let frameSequence: UInt64
     let frameContentFingerprint: UInt64
+    let boardVisualSignature: BoardFrameSignature
+    let boardGeometry: RecognitionBoardGeometry
     let recognizedBoardStateHash: String
     let geometryHash: String
     let minimumStableFrames: Int
@@ -46,6 +55,8 @@ struct ClickActionBinding: Hashable, Sendable {
         windowID: CGWindowID,
         frameSequence: UInt64,
         frameContentFingerprint: UInt64,
+        boardVisualSignature: BoardFrameSignature,
+        boardGeometry: RecognitionBoardGeometry,
         recognizedBoardStateHash: String,
         geometryHash: String,
         minimumStableFrames: Int = 2,
@@ -55,6 +66,8 @@ struct ClickActionBinding: Hashable, Sendable {
         self.windowID = windowID
         self.frameSequence = frameSequence
         self.frameContentFingerprint = frameContentFingerprint
+        self.boardVisualSignature = boardVisualSignature
+        self.boardGeometry = boardGeometry
         self.recognizedBoardStateHash = recognizedBoardStateHash
         self.geometryHash = geometryHash
         self.minimumStableFrames = max(1, minimumStableFrames)
@@ -165,11 +178,12 @@ actor ClickExecutor {
     private(set) var state: AutomationControlState = .paused(.userRequested)
     private(set) var pendingReceipt: ClickExecutionReceipt?
 
+    private let boardDifferencer = BoardFrameDifferencer()
     private var safetyEpoch: UInt64 = 0
     private let mouseDownDurationNanoseconds: UInt64
     private let sourceToDestinationDelayNanoseconds: UInt64
 
-    init(mouseDownMilliseconds: UInt64 = 18, sourceToDestinationDelayMilliseconds: UInt64 = 70) {
+    init(mouseDownMilliseconds: UInt64 = 18, sourceToDestinationDelayMilliseconds: UInt64 = 120) {
         mouseDownDurationNanoseconds = mouseDownMilliseconds * 1_000_000
         sourceToDestinationDelayNanoseconds = sourceToDestinationDelayMilliseconds * 1_000_000
     }
@@ -192,6 +206,324 @@ actor ClickExecutor {
         safetyEpoch &+= 1
         pendingReceipt = nil
         state = .manualTakeover
+    }
+
+    /// Hands foreground ownership to the already-locked target application and
+    /// returns a fresh stable frame from that exact window. No input event is
+    /// posted here. The caller must build its action binding from the returned
+    /// frame so activation/Space animations can never make an old token valid.
+    func prepareTargetForInput(
+        ownerPID: pid_t,
+        windowID: CGWindowID,
+        calibration: BoardCalibration,
+        capture: WindowCaptureService,
+        timeout: Duration = .seconds(2)
+    ) async throws -> CapturedFrame {
+        guard case .armed = state else {
+            if pendingReceipt != nil { throw ClickExecutorError.anotherActionInFlight }
+            throw ClickExecutorError.notArmed
+        }
+        guard pendingReceipt == nil else { throw ClickExecutorError.anotherActionInFlight }
+        guard MacPermissionsService.screenRecordingStatus == .granted else {
+            throw ClickExecutorError.screenRecordingPermissionMissing
+        }
+        guard MacPermissionsService.accessibilityStatus == .granted else {
+            throw ClickExecutorError.accessibilityPermissionMissing
+        }
+
+        let epoch = safetyEpoch
+        let activationContext = await MainActor.run { () -> (NSRunningApplication, TargetActivationRoute)? in
+            guard let application = NSRunningApplication(processIdentifier: ownerPID) else {
+                return nil
+            }
+            let route = Self.activationRoute(
+                frontmostPID: NSWorkspace.shared.frontmostApplication?.processIdentifier,
+                currentPID: NSRunningApplication.current.processIdentifier,
+                targetPID: ownerPID
+            )
+            return (application, route)
+        }
+        guard let activationContext else { throw ClickExecutorError.targetWindowMissing }
+
+        let activationRequest: Bool
+        switch activationContext.1 {
+            case .alreadyFrontmost:
+                activationRequest = true
+            case .cooperative:
+                await MainActor.run {
+                    NSApp.yieldActivation(to: activationContext.0)
+                }
+                activationRequest = await Self.activateThroughWorkspace(activationContext.0)
+            case .direct:
+                // Accessibility clients may legitimately invoke Confirm while
+                // another app is frontmost. NSRunningApplication.activate can
+                // report success while macOS keeps the previous foreground app.
+                // Reopening the already-running bundle with an activating
+                // NSWorkspace configuration reliably performs the public,
+                // user-visible foreground handoff without launching a duplicate.
+                activationRequest = await Self.activateThroughWorkspace(activationContext.0)
+        }
+
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        // A successful NSRunningApplication result means only that macOS
+        // accepted the request; it does not prove that foreground ownership
+        // changed. Give a cooperative/direct request a short opportunity to
+        // settle, then use the already-authorized Accessibility path once.
+        let fallbackDelay: Duration = activationRequest ? .milliseconds(180) : .zero
+        let fallbackNotBefore = clock.now.advanced(by: fallbackDelay)
+        var attemptedAccessibilityFallback = false
+        var sawOnScreenTarget = false
+        var sawFrontmostTarget = false
+        var previousBoardSignature: BoardFrameSignature?
+        var boardStableSince: ContinuousClock.Instant?
+        while clock.now < deadline {
+            guard safetyEpoch == epoch,
+                  case .armed = state,
+                  pendingReceipt == nil else {
+                throw ClickExecutorError.interrupted
+            }
+
+            let frontmostPID = await MainActor.run {
+                NSWorkspace.shared.frontmostApplication?.processIdentifier
+            }
+            if frontmostPID != ownerPID,
+               !attemptedAccessibilityFallback,
+               clock.now >= fallbackNotBefore {
+                attemptedAccessibilityFallback = true
+                _ = await MainActor.run {
+                    Self.raiseMatchingTargetWindowWithAccessibility(
+                        ownerPID: ownerPID,
+                        expectedFrame: calibration.windowFrame
+                    )
+                }
+            }
+
+            if let frame = try? await capture.latestFrame(),
+               frame.target.ownerPID == ownerPID,
+               frame.target.windowID == windowID,
+               let liveGeometry = frame.liveWindowGeometry,
+               liveGeometry.ownerPID == ownerPID,
+               liveGeometry.windowID == windowID {
+                sawOnScreenTarget = sawOnScreenTarget || liveGeometry.isOnScreen
+                if liveGeometry.isOnScreen,
+                   liveGeometry.layer == 0,
+                   frontmostPID == ownerPID,
+                   calibration.matches(windowFrame: liveGeometry.frame),
+                   abs(frame.imageSize.width - calibration.imageSize.width) <= 1,
+                   abs(frame.imageSize.height - calibration.imageSize.height) <= 1,
+                   frame.contentFingerprint != 0 {
+                    sawFrontmostTarget = true
+                    let signature = boardDifferencer.signature(
+                        image: frame.image,
+                        frameSequence: frame.sequence,
+                        geometry: Self.recognitionGeometry(from: calibration)
+                    )
+                    if let previousBoardSignature {
+                        let boardChanged = !boardDifferencer.changes(
+                            from: previousBoardSignature,
+                            to: signature,
+                            minimumScore: 0.035
+                        ).cells.isEmpty
+                        if boardChanged {
+                            boardStableSince = clock.now
+                        } else {
+                            boardStableSince = boardStableSince ?? clock.now
+                            if let boardStableSince,
+                               boardStableSince.duration(to: clock.now) >= .milliseconds(120) {
+                                return frame
+                            }
+                        }
+                    } else {
+                        boardStableSince = clock.now
+                    }
+                    previousBoardSignature = signature
+                }
+            }
+            try await Task.sleep(for: .milliseconds(30))
+        }
+
+        if !sawOnScreenTarget { throw ClickExecutorError.targetNotOnScreen }
+        if sawFrontmostTarget { throw ClickExecutorError.frameNotStable }
+        throw ClickExecutorError.targetNotFrontmost
+    }
+
+    static func activationRoute(
+        frontmostPID: pid_t?,
+        currentPID: pid_t,
+        targetPID: pid_t
+    ) -> TargetActivationRoute {
+        if frontmostPID == targetPID { return .alreadyFrontmost }
+        if frontmostPID == currentPID { return .cooperative }
+        return .direct
+    }
+
+    @MainActor
+    private static func activateThroughWorkspace(_ application: NSRunningApplication) async -> Bool {
+        guard let bundleURL = application.bundleURL else {
+            return application.activate(options: [.activateAllWindows])
+        }
+        let expectedPID = application.processIdentifier
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        configuration.addsToRecentItems = false
+        return await withCheckedContinuation { continuation in
+            NSWorkspace.shared.openApplication(
+                at: bundleURL,
+                configuration: configuration
+            ) { activatedApplication, error in
+                continuation.resume(
+                    returning: error == nil
+                        && activatedApplication?.processIdentifier == expectedPID
+                )
+            }
+        }
+    }
+
+    /// Returns a match only when one and only one AX window has the complete
+    /// calibrated position and size. Ambiguity is a hard failure: fallback
+    /// activation must never guess between same-process windows.
+    static func uniqueMatchingAXWindowIndex(
+        frames: [CGRect],
+        expectedFrame: CGRect,
+        tolerance: CGFloat = 0
+    ) -> Int? {
+        let matchingIndices = frames.indices.filter { index in
+            rectanglesMatch(frames[index], expectedFrame, tolerance: tolerance)
+        }
+        guard matchingIndices.count == 1 else { return nil }
+        return matchingIndices[0]
+    }
+
+    @MainActor
+    private static func raiseMatchingTargetWindowWithAccessibility(
+        ownerPID: pid_t,
+        expectedFrame: CGRect
+    ) -> Bool {
+        let applicationElement = AXUIElementCreateApplication(ownerPID)
+        var actualApplicationPID: pid_t = 0
+        guard AXUIElementGetPid(applicationElement, &actualApplicationPID) == .success,
+              actualApplicationPID == ownerPID,
+              let windows = axWindows(of: applicationElement) else {
+            return false
+        }
+
+        let framedWindows = windows.compactMap { window -> (AXUIElement, CGRect)? in
+            guard let frame = axWindowFrame(window) else { return nil }
+            return (window, frame)
+        }
+        guard let matchingIndex = uniqueMatchingAXWindowIndex(
+            frames: framedWindows.map { $0.1 },
+            expectedFrame: expectedFrame
+        ) else {
+            return false
+        }
+
+        let targetWindow = framedWindows[matchingIndex].0
+        var actualWindowPID: pid_t = 0
+        guard AXUIElementGetPid(targetWindow, &actualWindowPID) == .success,
+              actualWindowPID == ownerPID,
+              setAXBooleanIfWritable(targetWindow, attribute: kAXMainAttribute, value: true),
+              setRequiredAXBoolean(
+                applicationElement,
+                attribute: kAXFrontmostAttribute,
+                value: true
+              ),
+              AXUIElementPerformAction(targetWindow, kAXRaiseAction as CFString) == .success,
+              setAXBooleanIfWritable(targetWindow, attribute: kAXFocusedAttribute, value: true) else {
+            return false
+        }
+        return true
+    }
+
+    private static func axWindows(of application: AXUIElement) -> [AXUIElement]? {
+        var rawWindows: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            application,
+            kAXWindowsAttribute as CFString,
+            &rawWindows
+        ) == .success else {
+            return nil
+        }
+        return rawWindows as? [AXUIElement]
+    }
+
+    private static func axWindowFrame(_ window: AXUIElement) -> CGRect? {
+        guard let position = axPoint(window, attribute: kAXPositionAttribute),
+              let size = axSize(window, attribute: kAXSizeAttribute),
+              size.width > 1,
+              size.height > 1 else {
+            return nil
+        }
+        return CGRect(origin: position, size: size)
+    }
+
+    private static func axPoint(_ element: AXUIElement, attribute: String) -> CGPoint? {
+        var rawValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &rawValue) == .success,
+              let rawValue,
+              CFGetTypeID(rawValue) == AXValueGetTypeID() else {
+            return nil
+        }
+        var point = CGPoint.zero
+        guard AXValueGetValue(rawValue as! AXValue, .cgPoint, &point) else { return nil }
+        return point
+    }
+
+    private static func axSize(_ element: AXUIElement, attribute: String) -> CGSize? {
+        var rawValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &rawValue) == .success,
+              let rawValue,
+              CFGetTypeID(rawValue) == AXValueGetTypeID() else {
+            return nil
+        }
+        var size = CGSize.zero
+        guard AXValueGetValue(rawValue as! AXValue, .cgSize, &size) else { return nil }
+        return size
+    }
+
+    /// Optional window attributes are written only when the target advertises
+    /// them as settable. Unsupported attributes are safely skipped; a failed
+    /// write to an advertised attribute aborts the fallback.
+    private static func setAXBooleanIfWritable(
+        _ element: AXUIElement,
+        attribute: String,
+        value: Bool
+    ) -> Bool {
+        var isSettable = DarwinBoolean(false)
+        let queryResult = AXUIElementIsAttributeSettable(
+            element,
+            attribute as CFString,
+            &isSettable
+        )
+        guard queryResult == .success else { return true }
+        guard isSettable.boolValue else { return true }
+        return AXUIElementSetAttributeValue(
+            element,
+            attribute as CFString,
+            value ? kCFBooleanTrue : kCFBooleanFalse
+        ) == .success
+    }
+
+    private static func setRequiredAXBoolean(
+        _ element: AXUIElement,
+        attribute: String,
+        value: Bool
+    ) -> Bool {
+        var isSettable = DarwinBoolean(false)
+        guard AXUIElementIsAttributeSettable(
+            element,
+            attribute as CFString,
+            &isSettable
+        ) == .success,
+              isSettable.boolValue else {
+            return false
+        }
+        return AXUIElementSetAttributeValue(
+            element,
+            attribute as CFString,
+            value ? kCFBooleanTrue : kCFBooleanFalse
+        ) == .success
     }
 
     func execute(
@@ -227,6 +559,7 @@ actor ClickExecutor {
                 destinationPoint,
                 liveWindowFrame: beforeFrame.liveWindowGeometry?.frame,
                 calibration: calibration,
+                ownerPID: binding.ownerPID,
                 windowID: binding.windowID
             )
 
@@ -244,7 +577,12 @@ actor ClickExecutor {
                 actionID: actionID,
                 epoch: epoch
             )
-            guard Self.targetWindowIsTopmost(binding.windowID, at: [destinationPoint]) else {
+            guard Self.targetWindowIsTopmost(
+                binding.windowID,
+                ownerPID: binding.ownerPID,
+                expectedFrame: calibration.windowFrame,
+                at: [destinationPoint]
+            ) else {
                 throw ClickExecutorError.targetWindowOccluded
             }
             try await postClick(at: destinationPoint, actionID: actionID, epoch: epoch)
@@ -320,9 +658,7 @@ actor ClickExecutor {
             guard frame.sequence >= receipt.minimumVerificationFrameSequence else {
                 throw ClickExecutorError.verificationFrameMissing
             }
-            guard frame.consecutiveStableFrames >= max(1, minimumStableFrames) else {
-                throw ClickExecutorError.verificationFrameUnstable
-            }
+            _ = minimumStableFrames
             guard frame.contentFingerprint != receipt.beforeFrameFingerprint else {
                 throw ClickExecutorError.verificationSawNoVisualChange
             }
@@ -381,14 +717,38 @@ actor ClickExecutor {
         guard frame.sequence - binding.frameSequence <= binding.maximumFrameAdvance else {
             throw ClickExecutorError.frameAdvancedTooFar
         }
-        guard frame.contentFingerprint == binding.frameContentFingerprint else {
-            throw ClickExecutorError.frameContentChanged
+        if frame.contentFingerprint != binding.frameContentFingerprint {
+            let currentBoardSignature = boardDifferencer.signature(
+                image: frame.image,
+                frameSequence: frame.sequence,
+                geometry: binding.boardGeometry
+            )
+            let boardChange = boardDifferencer.changes(
+                from: binding.boardVisualSignature,
+                to: currentBoardSignature,
+                minimumScore: 0.035
+            )
+            guard boardChange.cells.isEmpty else {
+                throw ClickExecutorError.frameContentChanged
+            }
         }
         guard frame.contentFingerprint != 0 else {
             throw ClickExecutorError.frameFingerprintUnavailable
         }
-        guard frame.consecutiveStableFrames >= binding.minimumStableFrames else {
-            throw ClickExecutorError.frameNotStable
+        if frame.consecutiveStableFrames < binding.minimumStableFrames {
+            let currentBoardSignature = boardDifferencer.signature(
+                image: frame.image,
+                frameSequence: frame.sequence,
+                geometry: binding.boardGeometry
+            )
+            let boardChange = boardDifferencer.changes(
+                from: binding.boardVisualSignature,
+                to: currentBoardSignature,
+                minimumScore: 0.035
+            )
+            guard boardChange.cells.isEmpty else {
+                throw ClickExecutorError.frameNotStable
+            }
         }
         guard abs(frame.imageSize.width - calibration.imageSize.width) <= 1,
               abs(frame.imageSize.height - calibration.imageSize.height) <= 1 else {
@@ -425,6 +785,20 @@ actor ClickExecutor {
         )
     }
 
+    private static func recognitionGeometry(from calibration: BoardCalibration) -> RecognitionBoardGeometry {
+        let width = calibration.imageSize.width
+        let height = calibration.imageSize.height
+        func visionPoint(_ point: CGPoint) -> CGPoint {
+            CGPoint(x: point.x / width, y: 1 - point.y / height)
+        }
+        return RecognitionBoardGeometry(
+            topLeft: visionPoint(calibration.corners.topLeft),
+            topRight: visionPoint(calibration.corners.topRight),
+            bottomRight: visionPoint(calibration.corners.bottomRight),
+            bottomLeft: visionPoint(calibration.corners.bottomLeft)
+        )
+    }
+
     private func validateWindowAuthority(
         liveGeometry: LiveWindowGeometry?,
         ownerPID: pid_t,
@@ -455,6 +829,7 @@ actor ClickExecutor {
         _ destination: CGPoint,
         liveWindowFrame: CGRect?,
         calibration: BoardCalibration,
+        ownerPID: pid_t,
         windowID: CGWindowID
     ) throws {
         guard let liveWindowFrame,
@@ -463,7 +838,12 @@ actor ClickExecutor {
               liveWindowFrame.insetBy(dx: -1, dy: -1).contains(destination) else {
             throw ClickExecutorError.roiViolation
         }
-        guard Self.targetWindowIsTopmost(windowID, at: [source, destination]) else {
+        guard Self.targetWindowIsTopmost(
+            windowID,
+            ownerPID: ownerPID,
+            expectedFrame: liveWindowFrame,
+            at: [source, destination]
+        ) else {
             throw ClickExecutorError.targetWindowOccluded
         }
     }
@@ -540,10 +920,17 @@ actor ClickExecutor {
             && abs(lhs.height - rhs.height) <= tolerance
     }
 
-    /// CoreGraphics returns windows in front-to-back order. Reject a click when
-    /// any visible window in front of the locked target covers an action point,
-    /// even if that window belongs to the same foreground application.
-    private static func targetWindowIsTopmost(_ windowID: CGWindowID, at points: [CGPoint]) -> Bool {
+    /// CoreGraphics returns windows in front-to-back order. Some applications
+    /// (including visual effect/cursor helpers) publish mouse-transparent
+    /// composition surfaces above ordinary windows. Those surfaces must not be
+    /// treated as click blockers when Accessibility hit-testing still resolves
+    /// the exact locked target window at every action point.
+    private static func targetWindowIsTopmost(
+        _ windowID: CGWindowID,
+        ownerPID: pid_t,
+        expectedFrame: CGRect,
+        at points: [CGPoint]
+    ) -> Bool {
         guard !points.isEmpty,
               let rawList = CGWindowListCopyWindowInfo(
                 [.optionOnScreenOnly, .excludeDesktopElements],
@@ -566,8 +953,53 @@ actor ClickExecutor {
             guard CGRectMakeWithDictionaryRepresentation(boundsDictionary as CFDictionary, &bounds) else {
                 continue
             }
-            if points.contains(where: bounds.contains) { return false }
+            if points.contains(where: bounds.contains) {
+                return points.allSatisfy {
+                    accessibilityHitMatchesTargetWindow(
+                        at: $0,
+                        ownerPID: ownerPID,
+                        expectedFrame: expectedFrame
+                    )
+                }
+            }
         }
         return false
+    }
+
+    private static func accessibilityHitMatchesTargetWindow(
+        at point: CGPoint,
+        ownerPID: pid_t,
+        expectedFrame: CGRect
+    ) -> Bool {
+        let systemWideElement = AXUIElementCreateSystemWide()
+        var hitElement: AXUIElement?
+        guard AXUIElementCopyElementAtPosition(
+            systemWideElement,
+            Float(point.x),
+            Float(point.y),
+            &hitElement
+        ) == .success,
+              let hitElement else {
+            return false
+        }
+
+        var hitPID: pid_t = 0
+        guard AXUIElementGetPid(hitElement, &hitPID) == .success,
+              hitPID == ownerPID else {
+            return false
+        }
+
+        var rawWindow: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            hitElement,
+            kAXWindowAttribute as CFString,
+            &rawWindow
+        ) == .success,
+              let rawWindow,
+              CFGetTypeID(rawWindow) == AXUIElementGetTypeID(),
+              let frame = axWindowFrame(rawWindow as! AXUIElement) else {
+            return false
+        }
+        return rectanglesMatch(frame, expectedFrame)
     }
 }

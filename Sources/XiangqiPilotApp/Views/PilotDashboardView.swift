@@ -59,6 +59,11 @@ struct PilotDashboardView: View {
                 RecoverySheet(model: model)
             }
         }
+        .onChange(of: model.recoveryNeedsAttention) { _, needsAttention in
+            if needsAttention, activeModal == nil {
+                open(.recovery)
+            }
+        }
     }
 
     private func open(_ modal: DashboardModal) {

@@ -66,10 +66,43 @@ struct IntelligenceResponse: Codable, Sendable {
     let suggestedMove: String?
     let explanation: String?
     let warnings: [String]
+    let modelID: String?
+    let usage: ModelTokenUsage?
+
+    init(
+        requestID: UUID,
+        frameSequence: UInt64,
+        stateHash: String,
+        confidence: Double,
+        recognizedFEN: String?,
+        suggestedMove: String?,
+        explanation: String?,
+        warnings: [String],
+        modelID: String? = nil,
+        usage: ModelTokenUsage? = nil
+    ) {
+        self.requestID = requestID
+        self.frameSequence = frameSequence
+        self.stateHash = stateHash
+        self.confidence = confidence
+        self.recognizedFEN = recognizedFEN
+        self.suggestedMove = suggestedMove
+        self.explanation = explanation
+        self.warnings = warnings
+        self.modelID = modelID
+        self.usage = usage
+    }
 
     var isStructurallyValid: Bool {
         confidence.isFinite && (0...1).contains(confidence)
     }
+}
+
+struct ModelTokenUsage: Codable, Equatable, Sendable {
+    let inputTokens: Int
+    let outputTokens: Int
+
+    var totalTokens: Int { inputTokens + outputTokens }
 }
 
 struct ModelProviderConfiguration: Codable, Identifiable, Hashable, Sendable {

@@ -39,7 +39,9 @@ struct InspectorPanel: View {
                 .font(.system(size: 17, weight: .bold))
                 .foregroundStyle(CockpitPalette.primaryText)
 
-            Text(model.isEmergencyStopped ? "窗口操作已全部禁用，解除锁定后仍需重新识别。" : "已识别红方走，目标窗口和棋盘边界均已锁定。")
+            Text(model.isEmergencyStopped
+                 ? "窗口操作已全部禁用，解除锁定后仍需重新识别。"
+                 : "当前\(model.sideToMove == .red ? "红方" : "黑方")走；已锁定目标窗口和棋盘边界。")
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(CockpitPalette.secondaryText)
                 .fixedSize(horizontal: false, vertical: true)
@@ -62,17 +64,17 @@ struct InspectorPanel: View {
                 .frame(width: 58, height: 58)
 
                 VStack(alignment: .leading, spacing: 5) {
-                    Text("局面置信度")
+                    Text("局面可信度 · \(model.confidenceBasis)")
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(CockpitPalette.primaryText)
-                    Text("棋子 32/32 · 网格偏差 0.7 px")
+                    Text("棋子 \(model.pieces.count) 枚 · 网格偏差 \(gridDeviationText)")
                         .font(.system(size: 10, weight: .medium))
                         .foregroundStyle(CockpitPalette.secondaryText)
                     HStack(spacing: 5) {
-                        StatusDot(color: CockpitPalette.green)
-                        Text("满足安全阈值")
+                        StatusDot(color: model.isPositionTrusted ? CockpitPalette.green : CockpitPalette.amber)
+                        Text(model.isPositionTrusted ? "可信基准已建立" : "等待安全确认")
                             .font(.system(size: 10, weight: .semibold))
-                            .foregroundStyle(CockpitPalette.green)
+                            .foregroundStyle(model.isPositionTrusted ? CockpitPalette.green : CockpitPalette.amber)
                     }
                 }
             }
@@ -83,7 +85,7 @@ struct InspectorPanel: View {
 
     private var candidatesSection: some View {
         VStack(alignment: .leading, spacing: 9) {
-            SectionLabel(title: "候选着法", detail: "本地引擎")
+            SectionLabel(title: "候选着法", detail: model.engineSource.title)
 
             ForEach(Array(model.candidates.enumerated()), id: \.element.id) { index, candidate in
                 CandidateMoveRow(
@@ -95,6 +97,11 @@ struct InspectorPanel: View {
                 }
             }
         }
+    }
+
+    private var gridDeviationText: String {
+        guard let value = model.gridDeviationPixels else { return "未测量" }
+        return "\(value.formatted(.number.precision(.fractionLength(1)))) px"
     }
 
     private var controlModeSection: some View {
@@ -199,7 +206,7 @@ struct InspectorPanel: View {
                 HStack(alignment: .top, spacing: 7) {
                     Image(systemName: "info.circle.fill")
                         .foregroundStyle(CockpitPalette.cyan)
-                    Text("大模型仅用于解释与异常辅助，不参与合法性和点击校验。")
+                    Text("大模型仅在本地识别低置信度时复核局面；结果仍须通过棋规与画面校验。")
                         .font(.system(size: 9, weight: .medium))
                         .foregroundStyle(CockpitPalette.secondaryText)
                         .fixedSize(horizontal: false, vertical: true)
@@ -207,6 +214,30 @@ struct InspectorPanel: View {
                 .padding(9)
                 .background(CockpitPalette.cyan.opacity(0.06))
                 .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+                if let billing = model.lastModelBilling {
+                    VStack(alignment: .leading, spacing: 5) {
+                        HStack {
+                            Text("最近一次模型调用")
+                            Spacer()
+                            Text("¥\(billing.costCNY.formatted(.number.precision(.fractionLength(6))))")
+                                .foregroundStyle(CockpitPalette.green)
+                        }
+                        Text("\(billing.modelID) · 输入 \(billing.inputTokens) / 输出 \(billing.outputTokens) Token")
+                        Text("\(billing.durationMilliseconds) ms · 本局累计 ¥\(model.modelSessionCostCNY.formatted(.number.precision(.fractionLength(6))))")
+                        Text("阿里百炼官网费率 · \(billing.pricingUpdatedAt.formatted(date: .numeric, time: .omitted)) 更新")
+                            .foregroundStyle(CockpitPalette.tertiaryText)
+                    }
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(CockpitPalette.secondaryText)
+                    .padding(9)
+                    .background(Color.white.opacity(0.025))
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                } else {
+                    Text("尚未调用云端模型 · 本局累计 ¥0.000000")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(CockpitPalette.tertiaryText)
+                }
             }
         }
         .padding(13)
@@ -224,8 +255,16 @@ struct InspectorPanel: View {
                     .foregroundStyle(CockpitPalette.amber)
             }
 
-            safetyRow("目标窗口锁定", detail: "通过", color: CockpitPalette.green)
-            safetyRow("局面合法性", detail: "通过", color: CockpitPalette.green)
+            safetyRow(
+                "目标窗口锁定",
+                detail: model.source.isLocked ? "通过" : "未锁定",
+                color: model.source.isLocked ? CockpitPalette.green : CockpitPalette.amber
+            )
+            safetyRow(
+                "局面可信基准",
+                detail: model.isPositionTrusted ? "通过" : "等待",
+                color: model.isPositionTrusted ? CockpitPalette.green : CockpitPalette.amber
+            )
             safetyRow("点击后画面校验", detail: "必需", color: CockpitPalette.blue)
             safetyRow("失败自动重试", detail: "关闭", color: CockpitPalette.secondaryText)
         }

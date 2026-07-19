@@ -174,7 +174,7 @@ enum EngineSource: String, CaseIterable, Identifiable {
     case ucci
 
     var id: String { rawValue }
-    var title: String { self == .local ? "本地象棋引擎" : "外部 UCCI 引擎" }
+    var title: String { self == .local ? "内置快速引擎" : "Pikafish 强力引擎" }
 }
 
 enum ModelSource: String, CaseIterable, Identifiable {
@@ -216,6 +216,29 @@ struct TimelineEvent: Identifiable, Hashable {
     let tone: TimelineTone
 }
 
+enum PositionRecoverySource: String, Hashable {
+    case localVision = "本地视觉"
+    case qwenFlash = "千问3.6 Flash"
+    case qwenPlus = "千问3.7 Plus"
+    case localAndAI = "本地视觉 + 千问"
+    case dualAI = "千问双模型一致"
+    case manual = "人工确认"
+}
+
+struct PositionRecoveryDifference: Identifiable, Hashable {
+    let coordinate: BoardCoordinate
+    let trustedPiece: BoardPiece?
+    let observedPiece: BoardPiece?
+
+    var id: String { "\(coordinate.column)-\(coordinate.row)" }
+
+    var detail: String {
+        let old = trustedPiece.map { "\($0.side.title)\($0.character)" } ?? "空位"
+        let new = observedPiece.map { "\($0.side.title)\($0.character)" } ?? "空位"
+        return "\(coordinate.column + 1)路 · \(coordinate.row + 1)行：\(old) → \(new)"
+    }
+}
+
 // MARK: - Pure UI state
 
 final class PilotPresentationModel: ObservableObject {
@@ -224,18 +247,43 @@ final class PilotPresentationModel: ObservableObject {
     @Published var previewMode: PreviewMode
     @Published var phase: PilotPhase
     @Published var controlMode: ControlMode
-    @Published var engineSource: EngineSource
+    @Published var engineSource: EngineSource {
+        didSet {
+            guard engineSource != oldValue else { return }
+            onEngineSourceChanged?(engineSource)
+        }
+    }
     @Published var modelSource: ModelSource
     @Published var selectedCandidateID: String
     @Published var confidence: Double
+    @Published var confidenceBasis: String
+    @Published var isPositionTrusted: Bool
+    @Published var gridDeviationPixels: Double?
+    @Published var lastModelBilling: ModelCallBilling?
+    @Published var modelSessionCostCNY: Double
     @Published var isPaused: Bool
     @Published var isEmergencyStopped: Bool
     @Published var events: [TimelineEvent]
 
     @Published var source: WindowSource
     @Published var pieces: [BoardPiece]
+    @Published var sideToMove: XiangqiSide
     @Published var candidates: [CandidateMove]
     @Published var liveImage: NSImage?
+    @Published var recoveryNeedsAttention = false
+    @Published var isRecovering = false
+    @Published var recoveryReason = "尚未检测到异常"
+    @Published var recoveryDetectedAt: Date?
+    @Published var lastTrustedPieceCount = 0
+    @Published var recoveryCandidatePieceCount: Int?
+    @Published var recoveryDifferences: [PositionRecoveryDifference] = []
+    @Published var recoveryConfidence: Double?
+    @Published var recoverySource: PositionRecoverySource?
+    @Published var recoveryCanAutoApply = false
+    @Published var recoveryHasCandidate = false
+    @Published var recoveryCandidatePieces: [BoardPiece] = []
+    @Published var recoveryCandidateSideToMove: XiangqiSide?
+    @Published var recoveryProgressText = "等待恢复任务"
 
     var onPauseChanged: ((Bool) -> Void)?
     var onEmergencyStop: (() -> Void)?
@@ -244,6 +292,10 @@ final class PilotPresentationModel: ObservableObject {
     var onApplyCorrection: (() -> Void)?
     var onConfirmMove: ((CandidateMove) -> Void)?
     var onRecover: (() -> Void)?
+    var onBeginRecovery: (() -> Void)?
+    var onApplyRecoveryCandidate: (() -> Void)?
+    var onDiscardRecoveryCandidate: (() -> Void)?
+    var onEngineSourceChanged: ((EngineSource) -> Void)?
     var onEditPiece: ((BoardCoordinate, XiangqiSide?, String?) -> Void)?
 
     var selectedCandidate: CandidateMove {
@@ -278,10 +330,16 @@ final class PilotPresentationModel: ObservableObject {
         modelSource: ModelSource = .off,
         selectedCandidateID: String = "cannon-center",
         confidence: Double = 0.987,
+        confidenceBasis: String = "尚未识别",
+        isPositionTrusted: Bool = false,
+        gridDeviationPixels: Double? = nil,
+        lastModelBilling: ModelCallBilling? = nil,
+        modelSessionCostCNY: Double = 0,
         isPaused: Bool = false,
         isEmergencyStopped: Bool = false,
         source: WindowSource,
         pieces: [BoardPiece],
+        sideToMove: XiangqiSide = .red,
         candidates: [CandidateMove],
         events: [TimelineEvent],
         liveImage: NSImage? = nil
@@ -295,10 +353,16 @@ final class PilotPresentationModel: ObservableObject {
         self.modelSource = modelSource
         self.selectedCandidateID = selectedCandidateID
         self.confidence = confidence
+        self.confidenceBasis = confidenceBasis
+        self.isPositionTrusted = isPositionTrusted
+        self.gridDeviationPixels = gridDeviationPixels
+        self.lastModelBilling = lastModelBilling
+        self.modelSessionCostCNY = modelSessionCostCNY
         self.isPaused = isPaused
         self.isEmergencyStopped = isEmergencyStopped
         self.source = source
         self.pieces = pieces
+        self.sideToMove = sideToMove
         self.candidates = candidates
         self.events = events
         self.liveImage = liveImage
@@ -307,7 +371,7 @@ final class PilotPresentationModel: ObservableObject {
     func chooseCandidate(_ candidate: CandidateMove) {
         selectedCandidateID = candidate.id
         phase = .previewing
-        prependEvent(
+        recordEvent(
             title: "已切换候选着法",
             detail: "拟落点更新为 \(candidate.notation)",
             symbolName: "arrow.triangle.swap",
@@ -318,7 +382,7 @@ final class PilotPresentationModel: ObservableObject {
     func togglePause() {
         guard !isEmergencyStopped else { return }
         isPaused.toggle()
-        prependEvent(
+        recordEvent(
             title: isPaused ? "已暂停" : "继续对局",
             detail: isPaused ? "视觉观察继续，窗口操作已锁定" : "重新校验后恢复控制",
             symbolName: isPaused ? "pause.fill" : "play.fill",
@@ -330,7 +394,7 @@ final class PilotPresentationModel: ObservableObject {
     func emergencyStop() {
         isEmergencyStopped = true
         isPaused = true
-        prependEvent(
+        recordEvent(
             title: "执行紧急停止",
             detail: "已取消拟落点并锁定全部窗口操作",
             symbolName: "octagon.fill",
@@ -343,7 +407,7 @@ final class PilotPresentationModel: ObservableObject {
         isEmergencyStopped = false
         isPaused = true
         phase = .recognizing
-        prependEvent(
+        recordEvent(
             title: "已解除急停",
             detail: "请重新识别局面后手动继续",
             symbolName: "lock.open.fill",
@@ -361,7 +425,7 @@ final class PilotPresentationModel: ObservableObject {
         }
         phase = .recognizing
         confidence = 0.992
-        prependEvent(
+        recordEvent(
             title: "完成任意局面识别",
             detail: "识别到 \(pieces.count) 枚棋子 · 红方走",
             symbolName: "viewfinder.circle.fill",
@@ -373,7 +437,7 @@ final class PilotPresentationModel: ObservableObject {
     func applyCorrection() {
         confidence = 0.998
         phase = .thinking
-        prependEvent(
+        recordEvent(
             title: "人工校正已应用",
             detail: "当前局面已设为新的可信基准",
             symbolName: "checkmark.seal.fill",
@@ -407,9 +471,9 @@ final class PilotPresentationModel: ObservableObject {
         guard !isPaused, !isEmergencyStopped else { return }
         guard selectedCandidate.id != CandidateMove.unavailable.id else { return }
         phase = .acting
-        prependEvent(
-            title: "确认执行 \(selectedCandidate.notation)",
-            detail: "拟落点已发送，等待画面校验",
+        recordEvent(
+            title: "准备执行 \(selectedCandidate.notation)",
+            detail: "正在激活并复核锁定窗口，尚未发送点击",
             symbolName: "cursorarrow.click.2",
             tone: .attention
         )
@@ -418,20 +482,20 @@ final class PilotPresentationModel: ObservableObject {
     }
 
     func markRecovered() {
-        isEmergencyStopped = false
-        isPaused = true
-        confidence = 0.995
-        phase = .previewing
-        prependEvent(
-            title: "异常已恢复",
-            detail: "局面和窗口均已重新锁定，请手动继续",
-            symbolName: "checkmark.shield.fill",
-            tone: .success
-        )
-        onRecover?()
+        guard recoveryHasCandidate else { return }
+        onApplyRecoveryCandidate?()
     }
 
-    private func prependEvent(
+    func beginRecovery() {
+        guard !isRecovering else { return }
+        onBeginRecovery?()
+    }
+
+    func discardRecovery() {
+        onDiscardRecoveryCandidate?()
+    }
+
+    func recordEvent(
         title: String,
         detail: String,
         symbolName: String,
@@ -449,6 +513,17 @@ final class PilotPresentationModel: ObservableObject {
                 tone: tone
             ),
             at: 0
+        )
+    }
+
+    func recordModelBilling(_ billing: ModelCallBilling) {
+        lastModelBilling = billing
+        modelSessionCostCNY += billing.costCNY
+        recordEvent(
+            title: "大模型识别完成",
+            detail: "\(billing.modelID) · \(billing.inputTokens)+\(billing.outputTokens) Token · ¥\(billing.costCNY.formatted(.number.precision(.fractionLength(6))))",
+            symbolName: "sparkles",
+            tone: .neutral
         )
     }
 }

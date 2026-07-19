@@ -5,6 +5,22 @@ struct UCCIEngineOption: Sendable, Hashable {
     let value: String
 }
 
+enum XiangqiEngineProtocol: Sendable {
+    case uci
+    case ucci
+
+    var initializeCommand: String { self == .uci ? "uci" : "ucci" }
+    var readyResponse: String { self == .uci ? "uciok" : "ucciok" }
+    func goCommand(milliseconds: Int) -> String {
+        self == .uci ? "go movetime \(milliseconds)" : "go time \(milliseconds)"
+    }
+    func optionCommand(_ option: UCCIEngineOption) -> String {
+        self == .uci
+            ? "setoption name \(option.name) value \(option.value)"
+            : "setoption \(option.name) \(option.value)"
+    }
+}
+
 struct UCCIAnalysis: Sendable, Hashable {
     let bestMove: String
     let ponderMove: String?
@@ -36,13 +52,19 @@ enum UCCIEngineError: LocalizedError {
 actor UCCIEngineClient {
     private let executableURL: URL
     private let options: [UCCIEngineOption]
+    private let engineProtocol: XiangqiEngineProtocol
     private var process: Process?
     private var input: FileHandle?
     private var outputBuffer: UCCIOutputBuffer?
     private var lastInfo = EngineInfoAccumulator()
 
-    init(executableURL: URL, options: [UCCIEngineOption] = []) {
+    init(
+        executableURL: URL,
+        engineProtocol: XiangqiEngineProtocol = .ucci,
+        options: [UCCIEngineOption] = []
+    ) {
         self.executableURL = executableURL
+        self.engineProtocol = engineProtocol
         self.options = options
     }
 
@@ -59,6 +81,7 @@ actor UCCIEngineClient {
         let stdoutPipe = Pipe()
         let buffer = UCCIOutputBuffer()
         process.executableURL = executableURL
+        process.currentDirectoryURL = executableURL.deletingLastPathComponent()
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
         process.standardError = stdoutPipe
@@ -77,13 +100,13 @@ actor UCCIEngineClient {
         self.input = stdinPipe.fileHandleForWriting
         self.outputBuffer = buffer
 
-        try send("ucci")
-        guard await waitForLine(prefix: "ucciok", timeoutMilliseconds: 2_500) != nil else {
+        try send(engineProtocol.initializeCommand)
+        guard await waitForLine(prefix: engineProtocol.readyResponse, timeoutMilliseconds: 2_500) != nil else {
             stop()
             throw UCCIEngineError.handshakeTimeout
         }
         for option in options {
-            try send("setoption \(option.name) \(option.value)")
+            try send(engineProtocol.optionCommand(option))
         }
         try send("isready")
         guard await waitForLine(prefix: "readyok", timeoutMilliseconds: 2_500) != nil else {
@@ -100,7 +123,7 @@ actor UCCIEngineClient {
         outputBuffer?.discardPendingLines()
         let suffix = moves.isEmpty ? "" : " moves \(moves.joined(separator: " "))"
         try send("position fen \(fen)\(suffix)")
-        try send("go time \(max(20, timeMilliseconds))")
+        try send(engineProtocol.goCommand(milliseconds: max(20, timeMilliseconds)))
 
         let timeout = max(1_000, timeMilliseconds + 1_500)
         let clock = ContinuousClock()

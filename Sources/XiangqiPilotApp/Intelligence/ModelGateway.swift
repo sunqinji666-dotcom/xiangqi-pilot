@@ -29,10 +29,12 @@ actor ModelGateway {
 
     func perform(
         _ request: IntelligenceRequest,
+        providerID requestedProviderID: UUID? = nil,
         currentFrameSequence: @escaping @Sendable () async -> UInt64,
         currentStateHash: @escaping @Sendable () async -> String
     ) async throws -> IntelligenceResponse {
-        guard let id = activeProviderID, let provider = providers[id] else {
+        guard let id = requestedProviderID ?? activeProviderID,
+              let provider = providers[id] else {
             throw ModelGatewayError.providerUnavailable
         }
         if request.boardImageJPEGBase64 != nil && !provider.configuration.allowsImageUpload {

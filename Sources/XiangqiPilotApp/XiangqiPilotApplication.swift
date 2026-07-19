@@ -1,8 +1,20 @@
 import SwiftUI
+import Darwin
 
 @main
 struct XiangqiPilotApplication: App {
     @StateObject private var runtime = PilotRuntime()
+
+    init() {
+        // Installation-only development bootstrap. It imports the API key from
+        // the user-provided Alibaba CSV into the local development cache and
+        // exits before SwiftUI creates a window. No credential is printed.
+        if CommandLine.arguments.contains("--bootstrap-development-credential") {
+            let store = APIKeyStore()
+            let imported = try? store.load(account: AlibabaBailianConfiguration.keychainAccount)
+            exit(imported == nil ? 1 : 0)
+        }
+    }
 
     var body: some Scene {
         WindowGroup("棋局驾驶舱") {
