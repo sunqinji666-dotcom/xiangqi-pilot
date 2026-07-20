@@ -29,6 +29,12 @@ enum BoardOrientation: String, CaseIterable, Identifiable, Sendable {
 
     var id: String { rawValue }
     var title: String { self == .redAtBottom ? "红方在下" : "红方在上" }
+
+    static func preset(for bundleIdentifier: String?) -> BoardOrientation? {
+        guard let bundleIdentifier else { return nil }
+        if bundleIdentifier == "com.cronlygames.chschess.mac" { return .redAtTop }
+        return nil
+    }
 }
 
 enum PositionVerificationPolicy {
@@ -237,6 +243,12 @@ final class PilotRuntime: ObservableObject {
     @Published var normalizedCorners = NormalizedBoardCorners()
     @Published var orientation: BoardOrientation = .redAtBottom
     @Published var sideToMove: Side = .red
+    @Published var xiangqiControlledSide: Side = .red
+    @Published var gridControlledSide: GridStone = .black
+    @Published var gridControlsBothSides = false
+    @Published var gridSideToMove: GridStone = .black
+    @Published var tencentPaidMatchConfirmationPending = false
+    @Published var detectedGridTerminal: GridTerminalResult?
     @Published var isBusy = false
     @Published var statusMessage = "正在检查系统权限…"
     @Published var blockingError: String? {
@@ -255,6 +267,8 @@ final class PilotRuntime: ObservableObject {
 
     private let capture = WindowCaptureService()
     private let clickExecutor = ClickExecutor()
+    private let gridState = GridGameRuntimeState()
+    private let gridTargetBootstrapper = GridTargetBootstrapper()
     private let recognizer = XiangqiVisionRecognizer()
     private let boardDifferencer = BoardFrameDifferencer()
     private let modelGateway = ModelGateway()
@@ -286,11 +300,45 @@ final class PilotRuntime: ObservableObject {
     /// unchanged board forever. A new visual pattern or a user retry clears it.
     private var recoveredOrAttemptedChangeKey: String?
     private var selectedBundleIdentifier: String?
+    /// Calibration is normally shared by application bundle. A browser can
+    /// host unrelated board sites with completely different layouts, so known
+    /// web adapters receive their own stable preference key.
+    private var selectedCalibrationKey: String?
     private var lastReconciledFrameSequence: UInt64 = 0
+    private var lastGridReconciledFrameSequence: UInt64 = 0
+    private var lastGridRecognitionAt: TimeInterval = 0
+    private var lastGridTerminalRecognitionAt: TimeInterval = 0
+    private var lastGridTerminalResult: GridTerminalResult?
+    /// An explicit cockpit-concede request is not evidence by itself. It only
+    /// supplies the expected result once the locked client visibly presents a
+    /// terminal overlay, including clients that draw the result glyph rather
+    /// than OCR-friendly text.
+    private var pendingConcededGridTerminal: GridTerminalResult?
+    /// A local-client reset may intentionally pass through a “失败/认输” page
+    /// before it opens a fresh board.  That is bootstrap plumbing, not the
+    /// terminal result of the game the cockpit is about to monitor.
+    private var gridBootstrapInProgress = false
+    /// A target window can briefly redraw a board while changing focus or
+    /// finishing an animation.  Never pause on a single noisy recognition;
+    /// require the same unexplained position in consecutive stable samples.
+    private var pendingGridUnexplainedObservation: [GridCoordinate: GridStone]?
+    private var pendingGridUnexplainedCount = 0
+    /// Local mobile-board clients repaint the last-move badge over several
+    /// frames after a verified grid click. During this short interval, colour
+    /// samples may temporarily disagree with the already-proven rule state.
+    private var lastAcceptedGridMoveAt: TimeInterval?
+    /// The exact intersection that was proved by the cockpit click receipt.
+    /// Tencent Go can render its last-move badge as an apparent empty or dark
+    /// point, so this one point is held as a visual stability anchor.
+    private var lastAcceptedGridCoordinate: GridCoordinate?
     /// A candidate may be published repeatedly while SwiftUI redraws.  Keep one
     /// pending automatic dispatch per exact board position so automatic mode
     /// cannot send duplicate clicks for the same move.
     private var automaticExecutionToken: String?
+    /// Explicit terminal actions have priority over automatic play. It closes
+    /// the short scheduling window between a visible preview and its queued
+    /// target-window click.
+    private var concedingGridGame = false
     /// Serializes every manual and automatic entry into the GUI action path.
     /// Main-actor async methods are re-entrant, so without this guard a second
     /// confirmation can arm the executor while the first one is activating the
@@ -303,6 +351,9 @@ final class PilotRuntime: ObservableObject {
     private var lastAcceptedVisualMoveAt: TimeInterval?
     private var lastWizardMoveOCRAttemptAt: TimeInterval = 0
     private var lastWizardTerminalResult: XiangqiWizardTerminalResult?
+    /// A deterministic terminal position may be observed repeatedly by the
+    /// capture loop. Record it once so the timeline remains a real audit log.
+    private var lastRuleTerminalPositionKey: PositionKey?
     /// Measured from the moment the current trusted position is sent to an
     /// engine until its candidate is published.  Persisted with executed moves
     /// so performance regressions are visible in the review timeline.
@@ -416,8 +467,9 @@ final class PilotRuntime: ObservableObject {
         blockingError = nil
         defer { isBusy = false }
         do {
-            availableWindows = try await capture.refreshAvailableWindows()
+            let windows = try await capture.refreshAvailableWindows()
                 .filter { $0.ownerPID != ProcessInfo.processInfo.processIdentifier }
+            availableWindows = windows.filter(matchesSelectedGameTarget)
             statusMessage = availableWindows.isEmpty
                 ? "没有找到可捕获窗口"
                 : "找到 \(availableWindows.count) 个可选窗口"
@@ -426,15 +478,89 @@ final class PilotRuntime: ObservableObject {
         }
     }
 
+    private func matchesSelectedGameTarget(_ window: CapturableWindow) -> Bool {
+        switch presentation.selectedGame {
+        case .xiangqi:
+            return true
+        case .gomoku:
+            return window.bundleIdentifier == "com.sining.wuziqi"
+                || window.applicationName.localizedCaseInsensitiveContains("五子棋")
+        case .go:
+            return window.bundleIdentifier == "com.tencent.TtgoForIos"
+                || window.applicationName.localizedCaseInsensitiveContains("腾讯围棋")
+        }
+    }
+
+    private func changeGameKind(_ gameKind: GameKind) async {
+        analysisTask?.cancel()
+        recoveryTask?.cancel()
+        await clickExecutor.pause(.manualTakeover)
+        await gridState.clickExecutor.pause()
+        calibration = nil
+        gridState.reset()
+        detectedGridTerminal = nil
+        lastGridTerminalResult = nil
+        lastGridTerminalRecognitionAt = 0
+        latestCapturedFrame = nil
+        trustedBoardSignature = nil
+        lastReconciledFrameSequence = 0
+        lastGridReconciledFrameSequence = 0
+        pendingGridUnexplainedObservation = nil
+        pendingGridUnexplainedCount = 0
+        lastAcceptedGridMoveAt = nil
+        lastAcceptedGridCoordinate = nil
+        pendingConcededGridTerminal = nil
+        positionIsTrusted = false
+        recognizedPieceCount = 0
+        presentation.pieces = []
+        presentation.gridStones = []
+        presentation.gridLineCount = gameKind.gridLineCount
+        presentation.gridSideToMove = .black
+        presentation.candidates = [.unavailable]
+        presentation.selectedCandidateID = CandidateMove.unavailable.id
+        presentation.sideToMove = .red
+        xiangqiControlledSide = .red
+        presentation.isPaused = true
+        presentation.phase = .observing
+        presentation.source = WindowSource(
+            id: "unselected",
+            applicationName: "尚未选择窗口",
+            windowTitle: "请选择\(gameKind.title)窗口",
+            isLocked: false
+        )
+        setupStep = .window
+        statusMessage = "请选择正在运行的\(gameKind.title)窗口"
+        await refreshWindows()
+    }
+
     func selectWindow(_ window: CapturableWindow) async {
         isBusy = true
         blockingError = nil
         lastWizardTerminalResult = nil
+        detectedGridTerminal = nil
+        lastGridTerminalResult = nil
+        lastGridTerminalRecognitionAt = 0
         do {
             let target = try await capture.lockWindow(window.windowID)
             selectedBundleIdentifier = window.bundleIdentifier
-            normalizedCorners = Self.savedCorners(for: window.bundleIdentifier)
-                ?? Self.cornerPreset(for: window.bundleIdentifier)
+            if presentation.selectedGame == .xiangqi,
+               let preset = BoardOrientation.preset(for: window.bundleIdentifier) {
+                orientation = preset
+                xiangqiControlledSide = preset == .redAtTop ? .black : .red
+            }
+            selectedCalibrationKey = Self.calibrationKey(
+                bundleIdentifier: window.bundleIdentifier,
+                windowTitle: target.title
+            )
+            normalizedCorners = Self.savedCorners(for: selectedCalibrationKey)
+                ?? Self.gridCornerPreset(
+                    for: presentation.selectedGame,
+                    bundleIdentifier: window.bundleIdentifier
+                )
+                ?? Self.cornerPreset(
+                    for: window.bundleIdentifier,
+                    windowTitle: target.title
+                )
                 ?? NormalizedBoardCorners()
             selectedWindowID = window.windowID
             presentation.source = WindowSource(
@@ -459,6 +585,107 @@ final class PilotRuntime: ObservableObject {
         isBusy = false
     }
 
+    func startSelectedGridGame() async {
+        await startSelectedGridGame(authorizingTencentPaidMatch: false)
+    }
+
+    /// The second confirmation lives in the cockpit UI and is intentionally
+    /// ephemeral: it authorizes only the currently visible Tencent Go cost
+    /// dialog, never future matches or arbitrary client controls.
+    func confirmTencentPaidMatchAndStart() async {
+        guard presentation.selectedGame == .go,
+              tencentPaidMatchConfirmationPending else { return }
+        await startSelectedGridGame(authorizingTencentPaidMatch: true)
+    }
+
+    private func startSelectedGridGame(authorizingTencentPaidMatch: Bool) async {
+        guard presentation.selectedGame != .xiangqi else { return }
+        isBusy = true
+        gridBootstrapInProgress = true
+        // Do not let a terminal label observed during the old-game cleanup
+        // carry into the fresh session after the launcher completes.
+        detectedGridTerminal = nil
+        lastGridTerminalResult = nil
+        defer {
+            isBusy = false
+            gridBootstrapInProgress = false
+            lastGridTerminalResult = nil
+        }
+        do {
+            let stage = gridState.bootstrapStage
+            statusMessage = "驾驶舱正在请求启动本机\(presentation.selectedGame.title)对局…"
+            try await gridTargetBootstrapper.advanceLocalAI(
+                game: presentation.selectedGame,
+                stage: stage,
+                capture: capture,
+                authorizingTencentPaidMatch: authorizingTencentPaidMatch
+            )
+            tencentPaidMatchConfirmationPending = false
+            gridState.bootstrapStage += 1
+            statusMessage = presentation.selectedGame == .gomoku && stage == 0
+                ? "已打开难度页；请点击“选择入门难度并开始”"
+                : "本机对局入口已打开，请在下方标定真实棋盘四角"
+            presentation.recordEvent(
+                title: "已启动本机人机入口",
+                detail: "\(presentation.selectedGame.title)目标窗口已由驾驶舱操作（步骤\(stage + 1)）",
+                symbolName: "play.circle.fill",
+                tone: .success
+            )
+        } catch GridTargetBootstrapError.paidConfirmationRequired {
+            tencentPaidMatchConfirmationPending = true
+            blockingError = GridTargetBootstrapError.paidConfirmationRequired.localizedDescription
+        } catch {
+            blockingError = error.localizedDescription
+        }
+    }
+
+    func concedeCurrentGridGame() async {
+        guard presentation.selectedGame == .go else {
+            blockingError = "当前仅支持通过驾驶舱结束腾讯围棋局"
+            return
+        }
+        guard setupStep == .ready, positionIsTrusted else {
+            blockingError = "请先完成围棋局面确认后再结束本局"
+            return
+        }
+        guard !executionInProgress else {
+            blockingError = "当前自动落子正在验证，请等待本手完成后再结束本局"
+            return
+        }
+        concedingGridGame = true
+        automaticExecutionToken = nil
+        presentation.isPaused = true
+        isBusy = true
+        presentation.phase = .acting
+        defer { isBusy = false }
+        do {
+            pendingConcededGridTerminal = .loss
+            try await gridTargetBootstrapper.concedeCurrentGo(capture: capture)
+            pendingConcededGridTerminal = nil
+            lastGridTerminalResult = .loss
+            detectedGridTerminal = .loss
+            finishGridGame("腾讯围棋客户端终局：失败（驾驶舱确认认输并验证画面回执）")
+            presentation.recordEvent(
+                title: "腾讯围棋终局已验证",
+                detail: "驾驶舱确认认输后，锁定客户端窗口已产生终局画面回执",
+                symbolName: "flag.fill",
+                tone: .success
+            )
+        } catch {
+            pendingConcededGridTerminal = nil
+            concedingGridGame = false
+            presentation.phase = .observing
+            blockingError = error.localizedDescription
+        }
+    }
+
+    var selectedGridBootstrapTitle: String {
+        if presentation.selectedGame == .gomoku, gridState.bootstrapStage == 1 {
+            return "选择入门难度并开始"
+        }
+        return "启动本机人机对局"
+    }
+
     func confirmCalibration() async {
         guard let frame = latestCapturedFrame,
               let liveWindow = frame.liveWindowGeometry else {
@@ -477,12 +704,25 @@ final class PilotRuntime: ObservableObject {
                 bottomRight: CGPoint(x: normalizedCorners.bottomRight.x * size.width,
                                      y: normalizedCorners.bottomRight.y * size.height)
             )
+            if let lineCount = presentation.selectedGame.gridLineCount {
+                gridState.calibration = try GridBoardCalibration(
+                    corners: corners,
+                    imageSize: size,
+                    windowFrame: liveWindow.frame,
+                    lineCount: lineCount
+                )
+                Self.saveCorners(normalizedCorners, for: selectedCalibrationKey)
+                setupStep = .position
+                statusMessage = "正在识别\(presentation.selectedGame.title)局面…"
+                await recognizeGridPosition()
+                return
+            }
             calibration = try BoardCalibration(
                 corners: corners,
                 imageSize: size,
                 windowFrame: liveWindow.frame
             )
-            Self.saveCorners(normalizedCorners, for: selectedBundleIdentifier)
+            Self.saveCorners(normalizedCorners, for: selectedCalibrationKey)
             setupStep = .position
             statusMessage = "正在识别任意象棋局面…"
             await recognizeCurrentPosition()
@@ -502,6 +742,43 @@ final class PilotRuntime: ObservableObject {
         defer { isBusy = false }
 
         do {
+            if XiangqiWebMoveLogReader.matches(
+                bundleIdentifier: selectedBundleIdentifier,
+                windowTitle: frame.target.title
+            ) {
+                guard let replay = XiangqiWebMoveLogReader.replayedPosition(
+                    ownerPID: frame.target.ownerPID
+                ) else {
+                    throw XiangqiError.invalidFEN("网页走棋记录无法解析")
+                }
+                game.reset(to: .standard)
+                for move in replay.moves {
+                    _ = try game.play(move)
+                }
+                sideToMove = replay.position.sideToMove
+                positionIsTrusted = true
+                recognizedPieceCount = replay.position.board.pieceCount()
+                recognitionWarnings = []
+                presentation.confidence = 1
+                presentation.confidenceBasis = "网页官方走棋记录＋本地棋规"
+                trustedBoardSignature = boardDifferencer.signature(
+                    image: frame.image,
+                    frameSequence: frame.sequence,
+                    geometry: recognitionGeometry(from: calibration)
+                )
+                synchronizePresentation(position: replay.position)
+                statusMessage = replay.moves.isEmpty
+                    ? "已通过网页官方记录确认标准开局"
+                    : "已通过网页官方记录同步\(replay.moves.count)个半回合"
+                presentation.recordEvent(
+                    title: "网页局面已可信同步",
+                    detail: "\(replay.moves.count)个半回合 · 官方记录＋本地棋规",
+                    symbolName: "checkmark.seal.fill",
+                    tone: .success
+                )
+                await analyzeCurrentPosition()
+                return
+            }
             let geometry = recognitionGeometry(from: calibration)
             let signature = boardDifferencer.signature(
                 image: frame.image,
@@ -675,6 +952,89 @@ final class PilotRuntime: ObservableObject {
                 tone: .attention
             )
         }
+    }
+
+    /// Recognition path for a 15×15 Gomoku or 19-line Go board.  It relies on
+    /// calibrated stone discs, then asks the rules core to reject impossible
+    /// colour counts before the digital board becomes trusted.
+    func recognizeGridPosition() async {
+        guard let frame = latestCapturedFrame,
+              let calibration = gridState.calibration,
+              let lineCount = presentation.selectedGame.gridLineCount else {
+            blockingError = "请先完成交点棋盘标定"
+            return
+        }
+        isBusy = true
+        presentation.phase = .recognizing
+        defer { isBusy = false }
+        // A result card is not an empty board.  This guard is deliberately
+        // before colour sampling so a completed game can never establish a
+        // fresh trusted baseline merely because its artwork happens to look
+        // empty at the calibrated intersections.
+        if finishGridGameIfTerminalVisible(in: frame) {
+            return
+        }
+        let snapshot = GridStoneRecognizer.recognize(image: frame.image, calibration: calibration)
+        let stones = snapshot.stones
+        let isFirstGridRecognition = gridState.lastObservedStones.isEmpty
+            && gridState.gomokuPosition == nil
+            && gridState.goPosition == nil
+        let trusted: Bool
+        switch presentation.selectedGame {
+        case .gomoku:
+            guard let position = GridGameTransitionPolicy.initialGomokuPosition(size: lineCount, stones: stones) else {
+                blockingError = "五子棋颜色或手数不符合合法轮次，请检查四角标定"
+                presentation.confidence = snapshot.confidence
+                return
+            }
+            gridState.gomokuPosition = position
+            gridState.goPosition = nil
+            gridSideToMove = position.sideToMove
+            trusted = true
+        case .go:
+            guard let position = GridGameTransitionPolicy.initialGoPosition(size: lineCount, stones: stones) else {
+                blockingError = "围棋颜色或让子数量不符合规则，请检查四角标定"
+                presentation.confidence = snapshot.confidence
+                return
+            }
+            gridState.goPosition = position
+            gridState.gomokuPosition = nil
+            gridSideToMove = position.sideToMove
+            trusted = true
+        case .xiangqi:
+            return
+        }
+        gridState.lastObservedStones = stones
+        // Local AI clients commonly make the opening move before the cockpit
+        // finishes calibration.  On a newly locked board, default control to
+        // the side that is actually due to move, so automatic mode can begin
+        // immediately rather than silently waiting for the already-acted side.
+        if isFirstGridRecognition {
+            gridControlledSide = gridSideToMove
+        }
+        synchronizeGridPresentation(stones: stones, lineCount: lineCount)
+        positionIsTrusted = trusted
+        recognizedPieceCount = stones.count
+        presentation.confidence = snapshot.confidence
+        presentation.confidenceBasis = "本地交点色彩识别＋规则校验"
+        blockingError = nil
+        statusMessage = "已识别\(stones.count)枚\(presentation.selectedGame.title)棋子，请确认执棋方后进入驾驶舱"
+        presentation.recordEvent(
+            title: "交点棋局已识别",
+            detail: "\(stones.count)枚 · \(presentation.selectedGame.title) · 本地色彩识别＋规则校验",
+            symbolName: "checkmark.seal.fill",
+            tone: .success
+        )
+    }
+
+    private func synchronizeGridPresentation(stones: [GridCoordinate: GridStone], lineCount: Int) {
+        presentation.gridLineCount = lineCount
+        presentation.gridStones = stones.map { GridStonePiece(side: $0.value, coordinate: $0.key) }
+            .sorted { $0.coordinate < $1.coordinate }
+        presentation.gridSideToMove = gridSideToMove
+        presentation.pieces = []
+        presentation.candidates = [.unavailable]
+        presentation.selectedCandidateID = CandidateMove.unavailable.id
     }
 
     /// Shows the recognizer's best-effort board without pretending it is
@@ -1116,6 +1476,34 @@ final class PilotRuntime: ObservableObject {
     }
 
     func completeSetup() async {
+        if presentation.selectedGame != .xiangqi {
+            guard gridState.calibration != nil else {
+                blockingError = "请先完成交点棋盘标定"
+                return
+            }
+            guard positionIsTrusted else {
+                blockingError = "请先识别并确认当前局面"
+                return
+            }
+            gridState.controlledSide = gridControlledSide
+            gridState.controlsBothSides = gridControlsBothSides
+            presentation.gridSelfPlayEnabled = gridControlsBothSides
+            blockingError = nil
+            presentation.safetyNotice = nil
+            setupStep = .ready
+            presentation.isPaused = false
+            presentation.phase = .observing
+            try? await gridState.clickExecutor.arm()
+            statusMessage = "\(presentation.selectedGame.title)驾驶舱已就绪"
+            presentation.recordEvent(
+                title: "驾驶舱开始实时监控",
+                detail: "\(presentation.gridStones.count)枚棋子 · \(gridControlsBothSides ? "双方自动自测" : "我方\(gridControlledSide == .black ? "黑方" : "白方")")",
+                symbolName: "waveform.path.ecg",
+                tone: .success
+            )
+            await analyzeGridPosition()
+            return
+        }
         guard calibration != nil else {
             blockingError = "请先完成棋盘标定"
             return
@@ -1125,6 +1513,7 @@ final class PilotRuntime: ObservableObject {
             return
         }
         blockingError = nil
+        presentation.safetyNotice = nil
         setupStep = .ready
         presentation.isPaused = false
         presentation.phase = .observing
@@ -1159,9 +1548,73 @@ final class PilotRuntime: ObservableObject {
         await analyzeCurrentPosition()
     }
 
+    private func analyzeGridPosition() async {
+        guard presentation.selectedGame != .xiangqi else { return }
+        presentation.phase = .thinking
+        let recommendation: GridGameRecommendation?
+        switch presentation.selectedGame {
+        case .gomoku:
+            guard let position = gridState.gomokuPosition else { return }
+            gridSideToMove = position.sideToMove
+            recommendation = GomokuHeuristicEngine.bestMove(in: position).map { point in
+                GridGameRecommendation(coordinate: point, notation: gridNotation(point), score: 80, reason: "本地连五战术与阻挡校验")
+            }
+        case .go:
+            guard let position = gridState.goPosition else { return }
+            gridSideToMove = position.sideToMove
+            recommendation = GridGameAdvisor.go(position)
+        case .xiangqi:
+            return
+        }
+        guard gridState.controlsBothSides || gridSideToMove == gridState.controlledSide,
+              let recommendation,
+              let coordinate = recommendation.coordinate else {
+            presentation.candidates = [.unavailable]
+            presentation.selectedCandidateID = CandidateMove.unavailable.id
+            presentation.phase = .observing
+            statusMessage = (gridState.controlsBothSides || gridSideToMove == gridState.controlledSide)
+                ? "当前局面没有安全候选，请人工确认"
+                : "等待对方在目标窗口落子…"
+            return
+        }
+        let candidate = CandidateMove(
+            id: "grid:\(coordinate.column),\(coordinate.row)",
+            notation: recommendation.notation,
+            origin: BoardCoordinate(column: coordinate.column, row: coordinate.row),
+            target: BoardCoordinate(column: coordinate.column, row: coordinate.row),
+            score: recommendation.score,
+            evaluation: "本地规则",
+            reason: recommendation.reason
+        )
+        presentation.candidates = [candidate]
+        presentation.selectedCandidateID = candidate.id
+        presentation.phase = .previewing
+        statusMessage = "\(presentation.selectedGame.title)候选已通过规则校验"
+        scheduleAutomaticExecutionIfEligible()
+    }
+
+    private func gridNotation(_ coordinate: GridCoordinate) -> String {
+        let letters = Array("ABCDEFGHJKLMNOPQRST")
+        let letter = coordinate.column < letters.count ? String(letters[coordinate.column]) : "?"
+        return "\(letter)\(coordinate.row + 1)"
+    }
+
     func analyzeCurrentPosition(level: ThinkingLevel = .standard) async {
         analysisTask?.cancel()
         let position = game.position
+        if handleRuleTerminalPositionIfNeeded(position) {
+            return
+        }
+        guard presentation.selectedGame != .xiangqi
+            || position.sideToMove == xiangqiControlledSide else {
+            automaticExecutionToken = nil
+            presentation.candidates = [.unavailable]
+            presentation.selectedCandidateID = CandidateMove.unavailable.id
+            presentation.phase = .observing
+            presentation.isPaused = false
+            statusMessage = "等待\(position.sideToMove == .red ? "红方" : "黑方")在目标窗口落子…"
+            return
+        }
         let analysisStartedAt = ProcessInfo.processInfo.systemUptime
         presentation.phase = .thinking
         let selectedEngine = presentation.engineSource
@@ -1215,6 +1668,45 @@ final class PilotRuntime: ObservableObject {
         }
     }
 
+    @discardableResult
+    private func handleRuleTerminalPositionIfNeeded(_ position: Position) -> Bool {
+        let result: (winner: Side, detail: String)?
+        switch position.status {
+        case let .checkmate(loser, winner):
+            result = (winner, "\(sideName(loser))方被将死")
+        case let .stalemate(loser, winner):
+            result = (winner, "\(sideName(loser))方无合法着法")
+        case let .generalCaptured(loser, winner):
+            result = (winner, "\(sideName(loser))方将帅已失")
+        case .ongoing, .check:
+            result = nil
+        }
+        guard let result else { return false }
+
+        analysisTask?.cancel()
+        automaticExecutionToken = nil
+        presentation.candidates = [.unavailable]
+        presentation.selectedCandidateID = CandidateMove.unavailable.id
+        presentation.phase = .observing
+        presentation.isPaused = true
+        Task { [clickExecutor] in await clickExecutor.pause(.userRequested) }
+        statusMessage = "对局结束：\(sideName(result.winner))方胜（\(result.detail)）"
+        if lastRuleTerminalPositionKey != position.key {
+            lastRuleTerminalPositionKey = position.key
+            presentation.recordEvent(
+                title: "规则确认对局结束",
+                detail: "\(sideName(result.winner))方胜 · \(result.detail) · 本地棋规已验证",
+                symbolName: "flag.checkered",
+                tone: .success
+            )
+        }
+        return true
+    }
+
+    private func sideName(_ side: Side) -> String {
+        side == .red ? "红" : "黑"
+    }
+
     private func applyExternalAnalysis(_ result: UCCIAnalysis, position: Position) throws {
         guard let move = Move(ucci: result.bestMove), position.legalMoves.contains(move) else {
             throw UCCIEngineError.malformedBestMove
@@ -1237,6 +1729,10 @@ final class PilotRuntime: ObservableObject {
     }
 
     private func execute(_ candidate: CandidateMove) async {
+        if candidate.id.hasPrefix("grid:") {
+            await executeGridMove(candidate)
+            return
+        }
         automaticExecutionToken = nil
         guard !executionInProgress else {
             statusMessage = "当前落子正在执行，请勿重复确认"
@@ -1323,11 +1819,23 @@ final class PilotRuntime: ObservableObject {
                 "wait_for_visual_move",
                 milliseconds: (ProcessInfo.processInfo.systemUptime - verificationStartedAt) * 1_000
             )
-            _ = try await clickExecutor.verify(
-                receipt,
-                afterBoardStateHash: positionHash(verification.position),
-                capture: capture
-            )
+            if isWebMoveLogTarget(windowTitle: target.title) {
+                // The Xah Lee board paints its animation and appends its DOM
+                // score asynchronously.  `waitForExpectedPosition` has
+                // already proved the exact legal move in the official score;
+                // do not reject it merely because a later capture has the old
+                // pixels or an already-arrived reply.
+                _ = try await clickExecutor.verifyAuthoritativeMoveRecord(
+                    receipt,
+                    afterBoardStateHash: positionHash(verification.position)
+                )
+            } else {
+                _ = try await clickExecutor.verify(
+                    receipt,
+                    afterBoardStateHash: positionHash(verification.position),
+                    capture: capture
+                )
+            }
             _ = try game.play(move)
             let positionAfterExecutedMove = game.position
             lastAcceptedVisualMoveAt = ProcessInfo.processInfo.systemUptime
@@ -1375,6 +1883,244 @@ final class PilotRuntime: ObservableObject {
             await clickExecutor.pause(.verificationFailed(diagnostic.displayText))
             pause(reason: diagnostic.displayText)
         }
+    }
+
+    private func executeGridMove(_ candidate: CandidateMove) async {
+        automaticExecutionToken = nil
+        guard !executionInProgress,
+              let coordinate = gridCoordinate(from: candidate.id),
+              let calibration = gridState.calibration else {
+            return
+        }
+        // Re-read the locked window immediately before arming input.  The
+        // client can finish a game between candidate publication and this
+        // task running; never send a board click into a newly appeared result
+        // card.
+        if let frame = try? await capture.latestFrame(),
+           finishGridGameIfTerminalVisible(in: frame) {
+            return
+        }
+        executionInProgress = true
+        defer { executionInProgress = false }
+        do {
+            try await gridState.clickExecutor.arm()
+            presentation.phase = .acting
+            let receipt = try await gridState.clickExecutor.executeTap(
+                at: coordinate,
+                calibration: calibration,
+                capture: capture
+            )
+            presentation.phase = .verifying
+            // First prove that the locked target changed after the click. A
+            // Unity last-move badge can temporarily cover most of a white
+            // stone, so exact colour occupancy is a stronger *second* check,
+            // not the only acknowledgement of an already-proven board tap.
+            try await gridState.clickExecutor.verify(receipt, capture: capture)
+            let outcome: GridMoveOutcome
+            do {
+                outcome = try await waitForGridMove(
+                    coordinate: coordinate,
+                    afterSequence: receipt.beforeFrameSequence,
+                    timeout: .seconds(3)
+                )
+            } catch GridClickExecutorError.verificationUnchanged {
+                outcome = try expectedGridOutcome(for: coordinate)
+                statusMessage = "目标棋盘已确认变化；颜色标记待下一稳定帧复核"
+            }
+            if case .terminal = outcome {
+                return
+            }
+            applyGridOutcome(outcome, executed: coordinate)
+            presentation.phase = .observing
+            statusMessage = "数字棋盘已同步：\(gridNotation(coordinate))"
+            presentation.recordEvent(
+                title: "落子执行并验证",
+                detail: "\(gridNotation(coordinate)) · 规则与画面校验通过",
+                symbolName: "cursorarrow.click.2",
+                tone: .success
+            )
+            await analyzeGridPosition()
+        } catch {
+            await gridState.clickExecutor.pause()
+            pause(reason: "[GridClickExecutor] \(error.localizedDescription)")
+        }
+    }
+
+    private enum GridMoveOutcome {
+        case gomoku(GomokuPosition)
+        case go(GoPosition)
+        case terminal(GridTerminalResult)
+    }
+
+    private func waitForGridMove(
+        coordinate: GridCoordinate,
+        afterSequence: UInt64,
+        timeout: Duration = .seconds(20)
+    ) async throws -> GridMoveOutcome {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        var lastSequence = afterSequence
+        var expectedGomokuPosition: GomokuPosition?
+        var expectedGomokuObservedAt: ContinuousClock.Instant?
+        while clock.now < deadline {
+            if let frame = try? await capture.latestFrame(),
+               frame.sequence > lastSequence,
+               let calibration = gridState.calibration {
+                lastSequence = frame.sequence
+                if finishGridGameIfTerminalVisible(in: frame) {
+                    return .terminal(detectedGridTerminal ?? .draw)
+                }
+                let observed = GridStoneRecognizer.recognize(image: frame.image, calibration: calibration).stones
+                switch presentation.selectedGame {
+                case .gomoku:
+                    guard let current = gridState.gomokuPosition,
+                          let expected = try? current.applying(coordinate) else { break }
+                    if observed == expected.stones {
+                        // The installed 人机五子棋 client often paints our
+                        // stone one frame before its built-in AI replies. In
+                        // both-sides self-test mode, accepting that first
+                        // frame immediately makes the cockpit try to place
+                        // the AI's white move too, producing a double-paced
+                        // board and eventual recognition drift. Hold the
+                        // exact expected frame briefly so a real, legal
+                        // client reply can be absorbed as one verified
+                        // transition. If the client is genuinely passive,
+                        // preserve the existing self-test fallback below.
+                        expectedGomokuPosition = expected
+                        if expectedGomokuObservedAt == nil {
+                            expectedGomokuObservedAt = clock.now
+                        }
+                        if !gridState.controlsBothSides
+                            || expectedGomokuObservedAt!.duration(to: clock.now) >= .seconds(2) {
+                            return .gomoku(expected)
+                        }
+                        continue
+                    }
+                    if let reply = GridGameTransitionPolicy.nextGomokuMove(from: expected, observed: observed),
+                       let afterReply = try? expected.applying(reply) {
+                        return .gomoku(afterReply)
+                    }
+                case .go:
+                    guard let current = gridState.goPosition,
+                          let expected = try? current.applying(.play(coordinate)) else { break }
+                    if observed == expected.stones { return .go(expected) }
+                    if let reply = GridGameTransitionPolicy.nextGoMove(from: expected, observed: observed),
+                       let afterReply = try? expected.applying(reply) {
+                        return .go(afterReply)
+                    }
+                case .xiangqi:
+                    break
+                }
+            }
+            try await Task.sleep(for: .milliseconds(45))
+        }
+        if let expectedGomokuPosition {
+            return .gomoku(expectedGomokuPosition)
+        }
+        throw GridClickExecutorError.verificationUnchanged
+    }
+
+    private func expectedGridOutcome(for coordinate: GridCoordinate) throws -> GridMoveOutcome {
+        switch presentation.selectedGame {
+        case .gomoku:
+            guard let current = gridState.gomokuPosition else { throw GridClickExecutorError.verificationUnchanged }
+            return .gomoku(try current.applying(coordinate))
+        case .go:
+            guard let current = gridState.goPosition else { throw GridClickExecutorError.verificationUnchanged }
+            return .go(try current.applying(.play(coordinate)))
+        case .xiangqi:
+            throw GridClickExecutorError.verificationUnchanged
+        }
+    }
+
+    private func applyGridOutcome(_ outcome: GridMoveOutcome, executed: GridCoordinate? = nil) {
+        switch outcome {
+        case let .gomoku(position):
+            gridState.gomokuPosition = position
+            gridSideToMove = position.sideToMove
+            gridState.lastObservedStones = position.stones
+            synchronizeGridPresentation(stones: position.stones, lineCount: position.size)
+            handleGridTerminal(position.status)
+        case let .go(position):
+            gridState.goPosition = position
+            gridSideToMove = position.sideToMove
+            gridState.lastObservedStones = position.stones
+            synchronizeGridPresentation(stones: position.stones, lineCount: position.size)
+            handleGridTerminal(position.status)
+        case .terminal:
+            return
+        }
+        if executed != nil {
+            lastAcceptedGridMoveAt = ProcessInfo.processInfo.systemUptime
+            lastAcceptedGridCoordinate = executed
+        }
+    }
+
+    private func handleGridTerminal(_ status: GomokuStatus) {
+        guard case let .win(winner) = status else { return }
+        finishGridGame("\(winner == .black ? "黑" : "白")方连五获胜")
+    }
+
+    private func handleGridTerminal(_ status: GoStatus) {
+        guard case let .finished(black, white) = status else { return }
+        let winner = black == white ? "和棋" : (black > white ? "黑方胜" : "白方胜")
+        finishGridGame("\(winner) · 终局数子 黑\(black) : 白\(white)")
+    }
+
+    /// Returns true for every frame that visibly belongs to a terminal card,
+    /// not just the first one.  Callers must use the return value to prevent
+    /// result-card artwork from reaching the board recognizer.
+    @discardableResult
+    private func finishGridGameIfTerminalVisible(in frame: CapturedFrame) -> Bool {
+        guard presentation.selectedGame != .xiangqi,
+              !gridBootstrapInProgress else { return false }
+
+        if let conceded = pendingConcededGridTerminal,
+           GridTerminalRecognizer.recognizesTerminalOverlay(image: frame.image) {
+            pendingConcededGridTerminal = nil
+            lastGridTerminalResult = conceded
+            detectedGridTerminal = conceded
+            finishGridGame("\(presentation.selectedGame.title)客户端终局：\(conceded.title)")
+            return true
+        }
+
+        guard let terminal = GridTerminalRecognizer.recognize(image: frame.image) else {
+            return false
+        }
+        let needsAnnouncement = detectedGridTerminal != terminal
+            || lastGridTerminalResult != terminal
+            || !presentation.isPaused
+        lastGridTerminalResult = terminal
+        detectedGridTerminal = terminal
+        if needsAnnouncement {
+            finishGridGame("\(presentation.selectedGame.title)客户端终局：\(terminal.title)")
+        }
+        return true
+    }
+
+    private func finishGridGame(_ detail: String) {
+        automaticExecutionToken = nil
+        pendingGridUnexplainedObservation = nil
+        pendingGridUnexplainedCount = 0
+        blockingError = nil
+        presentation.isPaused = true
+        presentation.phase = .observing
+        presentation.candidates = [.unavailable]
+        presentation.selectedCandidateID = CandidateMove.unavailable.id
+        statusMessage = "对局结束：\(detail)"
+        presentation.recordEvent(
+            title: "规则确认对局结束",
+            detail: detail,
+            symbolName: "flag.checkered",
+            tone: .success
+        )
+        Task { [gridState] in await gridState.clickExecutor.pause() }
+    }
+
+    private func gridCoordinate(from identifier: String) -> GridCoordinate? {
+        let values = identifier.dropFirst("grid:".count).split(separator: ",")
+        guard values.count == 2, let column = Int(values[0]), let row = Int(values[1]) else { return nil }
+        return GridCoordinate(column: column, row: row)
     }
 
     /// Retries only before any mouse event has been posted.  Once execution
@@ -1426,6 +2172,40 @@ final class PilotRuntime: ObservableObject {
         move: Move,
         beforeBoardSignature: BoardFrameSignature
     ) async throws -> VerifiedMoveSequence {
+        if let target = await capture.lockedTarget(),
+           isWebMoveLogTarget(windowTitle: target.title) {
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: .seconds(30))
+            let expectedPlyIndex = game.records.count
+            while clock.now < deadline {
+                if XiangqiWebMoveLogReader.latestLegalMove(
+                    ownerPID: target.ownerPID,
+                    expectedPlyIndex: expectedPlyIndex,
+                    position: game.position
+                ) == move {
+                    let frame = try await capture.latestFrame()
+                    let signature = if let calibration {
+                        boardDifferencer.signature(
+                            image: frame.image,
+                            frameSequence: frame.sequence,
+                            geometry: recognitionGeometry(from: calibration)
+                        )
+                    } else {
+                        beforeBoardSignature
+                    }
+                    PilotDiagnosticLogger.event(
+                        "expected_move_confirmed_by_web_record move=\(move.ucci) ply=\(expectedPlyIndex + 1)"
+                    )
+                    return VerifiedMoveSequence(
+                        position: expected,
+                        signature: signature,
+                        opponentReply: nil
+                    )
+                }
+                try await Task.sleep(for: .milliseconds(35))
+            }
+            throw ClickExecutorError.verificationBoardStateUnchanged
+        }
         let clock = ContinuousClock()
         // Some target programs animate or think before committing a move. Keep
         // observing long enough to accept that delayed result, but make the hot
@@ -1564,6 +2344,13 @@ final class PilotRuntime: ObservableObject {
         throw ClickExecutorError.verificationBoardStateUnchanged
     }
 
+    private func isWebMoveLogTarget(windowTitle: String) -> Bool {
+        XiangqiWebMoveLogReader.matches(
+            bundleIdentifier: selectedBundleIdentifier,
+            windowTitle: windowTitle
+        )
+    }
+
     private func applyAnalysis(_ analysis: EngineAnalysis) {
         let legalMoves = Set(game.position.legalMoves)
         let candidates = analysis.candidates.filter { legalMoves.contains($0.move) }.map { candidate -> CandidateMove in
@@ -1590,6 +2377,7 @@ final class PilotRuntime: ObservableObject {
     /// manually confirmed move and binds it to the exact trusted position.
     private func scheduleAutomaticExecutionIfEligible() {
         guard presentation.controlMode == .automatic,
+              !concedingGridGame,
               !presentation.isPaused,
               !presentation.isEmergencyStopped,
               positionIsTrusted,
@@ -1597,11 +2385,15 @@ final class PilotRuntime: ObservableObject {
             return
         }
         let candidate = presentation.selectedCandidate
-        guard candidate.id != CandidateMove.unavailable.id,
-              Move(ucci: candidate.id) != nil else {
+        guard candidate.id != CandidateMove.unavailable.id else {
             return
         }
-        let positionKey = game.position.key
+        let executable = switch presentation.selectedGame {
+        case .xiangqi: Move(ucci: candidate.id) != nil
+        case .gomoku, .go: gridCoordinate(from: candidate.id) != nil
+        }
+        guard executable else { return }
+        let positionKey = automaticPositionBindingKey()
         let token = "\(positionKey)|\(candidate.id)"
         guard automaticExecutionToken != token else { return }
         automaticExecutionToken = token
@@ -1621,7 +2413,7 @@ final class PilotRuntime: ObservableObject {
                   !self.presentation.isPaused,
                   !self.presentation.isEmergencyStopped,
                   self.positionIsTrusted,
-                  self.game.position.key == positionKey,
+                  self.automaticPositionBindingKey() == positionKey,
                   self.presentation.selectedCandidate.id == candidate.id else {
                 if self?.automaticExecutionToken == token {
                     self?.automaticExecutionToken = nil
@@ -1630,6 +2422,36 @@ final class PilotRuntime: ObservableObject {
             }
             await self.execute(candidate)
         }
+    }
+
+    /// Every scheduled click is bound to the exact recognised position.  The
+    /// Xiangqi FEN key cannot protect a Gomoku/Go candidate because those
+    /// games intentionally use their own rule cores.
+    private func automaticPositionBindingKey() -> String {
+        switch presentation.selectedGame {
+        case .xiangqi:
+            String(describing: game.position.key)
+        case .gomoku:
+            gridPositionBindingKey(
+                stones: gridState.gomokuPosition?.stones ?? [:],
+                side: gridState.gomokuPosition?.sideToMove
+            )
+        case .go:
+            gridPositionBindingKey(
+                stones: gridState.goPosition?.stones ?? [:],
+                side: gridState.goPosition?.sideToMove
+            )
+        }
+    }
+
+    private func gridPositionBindingKey(
+        stones: [GridCoordinate: GridStone],
+        side: GridStone?
+    ) -> String {
+        let placement = stones.sorted { $0.key < $1.key }
+            .map { "\($0.key.column),\($0.key.row),\($0.value.rawValue)" }
+            .joined(separator: ";")
+        return "grid:\(side?.rawValue ?? "none")|\(placement)"
     }
 
     private func configureIntelligence() async {
@@ -2162,15 +2984,86 @@ final class PilotRuntime: ObservableObject {
             ?? development
     }
 
-    private static func cornerPreset(for bundleIdentifier: String?) -> NormalizedBoardCorners? {
-        guard bundleIdentifier == "com.jpcxc.xqwiphone" else { return nil }
-        // 象棋巫师的棋盘在窗口左侧，右侧是对局信息栏。
-        return NormalizedBoardCorners(
-            topLeft: CGPoint(x: 0.086, y: 0.165),
-            topRight: CGPoint(x: 0.607, y: 0.165),
-            bottomLeft: CGPoint(x: 0.086, y: 0.902),
-            bottomRight: CGPoint(x: 0.607, y: 0.902)
-        )
+    private static func cornerPreset(
+        for bundleIdentifier: String?,
+        windowTitle: String
+    ) -> NormalizedBoardCorners? {
+        if bundleIdentifier == "com.jpcxc.xqwiphone" {
+            // 象棋巫师的棋盘在窗口左侧，右侧是对局信息栏。
+            return NormalizedBoardCorners(
+                topLeft: CGPoint(x: 0.086, y: 0.165),
+                topRight: CGPoint(x: 0.607, y: 0.165),
+                bottomLeft: CGPoint(x: 0.086, y: 0.902),
+                bottomRight: CGPoint(x: 0.607, y: 0.902)
+            )
+        }
+        if XiangqiWebMoveLogReader.matches(
+            bundleIdentifier: bundleIdentifier,
+            windowTitle: windowTitle
+        ) {
+            // Xah Lee's board fills Chrome's content column. This is only a
+            // starting point: the setup canvas remains the authority.
+            return NormalizedBoardCorners(
+                topLeft: CGPoint(x: 0.064, y: 0.151),
+                topRight: CGPoint(x: 0.893, y: 0.151),
+                bottomLeft: CGPoint(x: 0.064, y: 0.718),
+                bottomRight: CGPoint(x: 0.893, y: 0.718)
+            )
+        }
+        return nil
+    }
+
+    private static func gridCornerPreset(
+        for game: GameKind,
+        bundleIdentifier: String?
+    ) -> NormalizedBoardCorners? {
+        switch game {
+        case .gomoku where bundleIdentifier == "com.sining.wuziqi":
+            // Verified against the installed portrait 五子棋 client.  These
+            // are the outermost 15×15 intersections, not the decorative wood
+            // frame; the setup view still exposes all four handles.
+            return NormalizedBoardCorners(
+                topLeft: CGPoint(x: 0.055, y: 0.275),
+                topRight: CGPoint(x: 0.940, y: 0.275),
+                bottomLeft: CGPoint(x: 0.055, y: 0.758),
+                bottomRight: CGPoint(x: 0.940, y: 0.758)
+            )
+        case .go where bundleIdentifier == "com.tencent.TtgoForIos":
+            // Verified against the installed desktop Tencent Go AI board in
+            // 19-line mode. The board occupies the left panel; the right
+            // panel is player information and controls, not board pixels.
+            return NormalizedBoardCorners(
+                topLeft: CGPoint(x: 0.035, y: 0.086),
+                topRight: CGPoint(x: 0.582, y: 0.086),
+                bottomLeft: CGPoint(x: 0.035, y: 0.957),
+                bottomRight: CGPoint(x: 0.582, y: 0.957)
+            )
+        default:
+            return nil
+        }
+    }
+
+    private static func calibrationKey(
+        bundleIdentifier: String?,
+        windowTitle: String
+    ) -> String? {
+        guard let bundleIdentifier else { return nil }
+        // The installed 五子棋 client needed a corrected outer-intersection
+        // preset.  Version this preference so an old, wider calibration does
+        // not silently override the repaired geometry after an app update.
+        if bundleIdentifier == "com.sining.wuziqi" {
+            return "\(bundleIdentifier).grid15.v2"
+        }
+        if bundleIdentifier == "com.tencent.TtgoForIos" {
+            return "\(bundleIdentifier).grid19.v1"
+        }
+        if XiangqiWebMoveLogReader.matches(
+            bundleIdentifier: bundleIdentifier,
+            windowTitle: windowTitle
+        ) {
+            return "\(bundleIdentifier).xahlee-xiangqi"
+        }
+        return bundleIdentifier
     }
 
     private static func savedCorners(for bundleIdentifier: String?) -> NormalizedBoardCorners? {
@@ -2218,7 +3111,203 @@ final class PilotRuntime: ObservableObject {
         let image = NSImage(cgImage: frame.image, size: frame.imageSize)
         latestImage = image
         presentation.liveImage = image
+        if presentation.selectedGame != .xiangqi {
+            let now = ProcessInfo.processInfo.systemUptime
+            // Setup previews can legitimately show a previous game's result
+            // while the cockpit is locating the board and starting a fresh
+            // local match. A terminal is meaningful only after calibration
+            // has been confirmed and normal board monitoring is active.
+            if setupStep == .ready,
+               !gridBootstrapInProgress,
+               now - lastGridTerminalRecognitionAt >= 0.75 {
+                lastGridTerminalRecognitionAt = now
+                // Always consume a visible terminal frame.  Previously only
+                // the first matching result returned here; subsequent frames
+                // fell through to stone recognition, so the result artwork
+                // eventually overwrote a valid 14-stone game as an impossible
+                // 76-stone board.
+                if finishGridGameIfTerminalVisible(in: frame) {
+                    return
+                }
+            }
+            reconcileGridPosition(from: frame)
+            return
+        }
         reconcileTrustedPosition(from: frame)
+    }
+
+    private func reconcileGridPosition(from frame: CapturedFrame) {
+        guard setupStep == .ready,
+              positionIsTrusted,
+              !presentation.isPaused,
+              detectedGridTerminal == nil,
+              !executionInProgress,
+              frame.sequence > lastGridReconciledFrameSequence,
+              let calibration = gridState.calibration else { return }
+        // ScreenCaptureKit streams the exact locked target even while the
+        // cockpit is frontmost.  Requiring foreground ownership here made
+        // the dashboard stop seeing legitimate opponent replies whenever the
+        // user followed the cockpit-only workflow.  Rule validation below is
+        // the safety boundary, not macOS focus state.
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - lastGridRecognitionAt >= 0.20 else { return }
+        lastGridRecognitionAt = now
+        lastGridReconciledFrameSequence = frame.sequence
+        let observed = GridStoneRecognizer.recognize(image: frame.image, calibration: calibration).stones
+        guard observed != gridState.lastObservedStones else {
+            pendingGridUnexplainedObservation = nil
+            pendingGridUnexplainedCount = 0
+            return
+        }
+        switch presentation.selectedGame {
+        case .gomoku:
+            guard let current = gridState.gomokuPosition,
+                  let move = GridGameTransitionPolicy.nextGomokuMove(from: current, observed: observed),
+                  let next = try? current.applying(move) else {
+                deferGridPauseIfObservationPersists(
+                    observed,
+                    reason: "五子棋画面变化连续三帧无法由唯一合法着法解释"
+                )
+                return
+            }
+            pendingGridUnexplainedObservation = nil
+            pendingGridUnexplainedCount = 0
+            applyGridOutcome(.gomoku(next))
+            presentation.recordEvent(
+                title: "数字棋盘已实时同步",
+                detail: "对方或人工落子：\(gridNotation(move))",
+                symbolName: "eye.fill",
+                tone: .success
+            )
+        case .go:
+            guard let current = gridState.goPosition,
+                  let move = GridGameTransitionPolicy.nextGoMove(from: current, observed: observed),
+                  let next = try? current.applying(move) else {
+                deferGridPauseIfObservationPersists(
+                    observed,
+                    reason: "围棋画面变化连续三帧无法由唯一合法着法解释"
+                )
+                return
+            }
+            pendingGridUnexplainedObservation = nil
+            pendingGridUnexplainedCount = 0
+            applyGridOutcome(.go(next))
+            presentation.recordEvent(
+                title: "数字棋盘已实时同步",
+                detail: "对方或人工落子：\(gridMoveDescription(move))",
+                symbolName: "eye.fill",
+                tone: .success
+            )
+        case .xiangqi:
+            return
+        }
+        Task { [weak self] in await self?.analyzeGridPosition() }
+    }
+
+    private func deferGridPauseIfObservationPersists(
+        _ observed: [GridCoordinate: GridStone],
+        reason: String
+    ) {
+        // The actual board tap was already confirmed by the locked target's
+        // changed stream. A transient mismatch immediately afterwards is most
+        // commonly the client's last-move halo/marker, not a second move.
+        // Let the marker settle; a real reply remains accepted earlier by the
+        // unique-legal-move path in `reconcileGridPosition`.
+        if let lastAcceptedGridMoveAt,
+           ProcessInfo.processInfo.systemUptime - lastAcceptedGridMoveAt <= 15.0 {
+            pendingGridUnexplainedObservation = nil
+            pendingGridUnexplainedCount = 0
+            statusMessage = "已验证落子，正在等待棋盘标记稳定…"
+            return
+        }
+        // Tencent Go keeps a dark last-move marker on a white stone. Once a
+        // cockpit click has been verified, an observation with the exact same
+        // occupied intersections but a different colour sample is therefore
+        // not a move and must never safety-pause the game. Keep the proven
+        // digital position until a rule-valid reply or a materially different
+        // board is observed.
+        if GridGameTransitionPolicy.hasMatchingOccupancy(
+            trusted: gridState.lastObservedStones,
+            observed: observed
+        ) {
+            pendingGridUnexplainedObservation = nil
+            pendingGridUnexplainedCount = 0
+            statusMessage = "棋子坐标一致，正在等待最后一手标记稳定…"
+            return
+        }
+        if let lastAcceptedGridCoordinate,
+           GridGameTransitionPolicy.differsOnlyAt(
+            lastAcceptedGridCoordinate,
+            trusted: gridState.lastObservedStones,
+            observed: observed
+           ) {
+            pendingGridUnexplainedObservation = nil
+            pendingGridUnexplainedCount = 0
+            statusMessage = "已锚定最后落点，正在等待棋盘标记稳定…"
+            return
+        }
+        // We have already proved our own click and the trusted rule position
+        // now says that the other side must move. A non-rule visual frame in
+        // this phase cannot authorize another cockpit click. Tencent Go may
+        // repaint decorations or shadows at unrelated intersections, so keep
+        // the proven position and wait for a frame that explains exactly one
+        // legal opponent move instead of stopping a healthy automatic match.
+        // If the opponent really plays, the unique-legal-move path above wins
+        // before reaching this guard.
+        if !gridState.controlsBothSides,
+           gridSideToMove != gridState.controlledSide {
+            pendingGridUnexplainedObservation = nil
+            pendingGridUnexplainedCount = 0
+            statusMessage = "等待对方落子：已忽略未通过规则校验的客户端装饰帧…"
+            return
+        }
+        if pendingGridUnexplainedObservation == observed {
+            pendingGridUnexplainedCount += 1
+        } else {
+            pendingGridUnexplainedObservation = observed
+            pendingGridUnexplainedCount = 1
+        }
+        guard pendingGridUnexplainedCount >= 3 else {
+            statusMessage = "正在复核棋盘瞬时变化（\(pendingGridUnexplainedCount)/3）"
+            return
+        }
+        let diagnostic = gridObservationDifference(trusted: gridState.lastObservedStones, observed: observed)
+        PilotDiagnosticLogger.event("grid_reconciliation_pause \(diagnostic)")
+        presentation.recordEvent(
+            title: "围棋识别差异待恢复",
+            detail: diagnostic,
+            symbolName: "exclamationmark.triangle",
+            tone: .attention
+        )
+        pause(reason: "\(reason) · \(diagnostic)")
+    }
+
+    private func gridObservationDifference(
+        trusted: [GridCoordinate: GridStone],
+        observed: [GridCoordinate: GridStone]
+    ) -> String {
+        func notationList(_ points: [GridCoordinate]) -> String {
+            let values = points.sorted {
+                $0.row == $1.row ? $0.column < $1.column : $0.row < $1.row
+            }.map(gridNotation)
+            return values.isEmpty ? "无" : values.joined(separator: ",")
+        }
+        let missing = trusted.keys.filter { observed[$0] == nil }
+        let unexpected = observed.keys.filter { trusted[$0] == nil }
+        let recolored = trusted.keys.filter { point in
+            guard let trustedStone = trusted[point],
+                  let observedStone = observed[point] else { return false }
+            return observedStone != trustedStone
+        }
+        let anchor = lastAcceptedGridCoordinate.map(gridNotation) ?? "无"
+        return "可信\(trusted.count)/观测\(observed.count)；末着\(anchor)；缺\(notationList(missing))；多\(notationList(unexpected))；变色\(notationList(recolored))"
+    }
+
+    private func gridMoveDescription(_ move: GoMove) -> String {
+        switch move {
+        case let .play(point): gridNotation(point)
+        case .pass: "停一手"
+        }
     }
 
     /// Keeps the rule-backed digital board synchronized with moves made by the
@@ -2230,6 +3319,11 @@ final class PilotRuntime: ObservableObject {
               frame.sequence > lastReconciledFrameSequence,
               let calibration,
               let trustedBoardSignature else { return }
+        let isWizardTarget = selectedBundleIdentifier == XiangqiWizardMoveLogReader.bundleIdentifier
+        let isWebMoveLogTarget = XiangqiWebMoveLogReader.matches(
+            bundleIdentifier: selectedBundleIdentifier,
+            windowTitle: frame.target.title
+        )
         if selectedBundleIdentifier == XiangqiWizardMoveLogReader.bundleIdentifier,
            lastWizardTerminalResult == nil,
            let terminalResult = XiangqiWizardMoveLogReader.terminalResult(
@@ -2244,7 +3338,14 @@ final class PilotRuntime: ObservableObject {
         // looks like a catastrophic board mutation. A real GUI move can only
         // be made while the locked target is frontmost, so inactive frames are
         // display-only and must never advance or invalidate the digital board.
-        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == frame.target.ownerPID else {
+        // A browser's official ICCS score is accessible even while the
+        // cockpit is frontmost.  Continuing to poll that deterministic record
+        // is both safer and more useful than demanding that the user leave the
+        // browser on top; no visual/OCR inference is accepted for this route.
+        // Pure visual targets still require foreground ownership so inactive
+        // rendering cannot be mistaken for a board mutation.
+        guard isWebMoveLogTarget
+                || NSWorkspace.shared.frontmostApplication?.processIdentifier == frame.target.ownerPID else {
             pendingObservedMove = nil
             rejectedChangeKey = nil
             rejectedChangeFirstSeenAt = nil
@@ -2275,7 +3376,6 @@ final class PilotRuntime: ObservableObject {
         // decorated, or rejected. The ply index prevents stale rows from being
         // replayed, and the local rules engine must resolve the notation to one
         // and only one legal move.
-        let isWizardTarget = selectedBundleIdentifier == XiangqiWizardMoveLogReader.bundleIdentifier
         let observationUptime = ProcessInfo.processInfo.systemUptime
         let wizardRecordedMove: Move? = if isWizardTarget {
             XiangqiWizardMoveLogReader.latestLegalMove(
@@ -2295,7 +3395,16 @@ final class PilotRuntime: ObservableObject {
         } else {
             nil
         }
-        if let recordedMove = wizardRecordedMove {
+        let webRecordedMove: Move? = if isWebMoveLogTarget {
+            XiangqiWebMoveLogReader.latestLegalMove(
+                ownerPID: frame.target.ownerPID,
+                expectedPlyIndex: game.records.count,
+                position: game.position
+            )
+        } else {
+            nil
+        }
+        if let recordedMove = wizardRecordedMove ?? webRecordedMove {
             let before = game.position
             do {
                 analysisTask?.cancel()
@@ -2308,11 +3417,13 @@ final class PilotRuntime: ObservableObject {
                 rejectedChangeFirstSeenAt = nil
                 recoveredOrAttemptedChangeKey = nil
                 presentation.confidence = 1
-                presentation.confidenceBasis = "象棋巫师走棋记录＋本地棋规"
+                presentation.confidenceBasis = isWizardTarget
+                    ? "象棋巫师走棋记录＋本地棋规"
+                    : "网页官方走棋记录＋本地棋规"
                 synchronizePresentation(position: game.position)
                 statusMessage = "数字棋盘已由确定性记录同步：\(recordedMove.ucci)"
                 PilotDiagnosticLogger.event(
-                    "wizard_move_log_confirmed move=\(recordedMove.ucci) ply=\(game.records.count)"
+                    "deterministic_move_log_confirmed move=\(recordedMove.ucci) ply=\(game.records.count)"
                 )
                 Task { [weak self] in
                     guard let self else { return }
@@ -2325,12 +3436,13 @@ final class PilotRuntime: ObservableObject {
                 return
             }
         }
-        // 象棋巫师's board highlight can briefly look exactly like a different
-        // legal two-endpoint move before its official row is committed. Never
-        // let that animation race the authoritative next-ply record. Generic
-        // windows and web boards continue through the visual policy below.
-        if isWizardTarget {
-            statusMessage = "等待象棋巫师发布第\(game.records.count + 1)步官方记录…"
+        // A move-list target's board animation can briefly look exactly like a
+        // different legal two-endpoint move. Never let that race its official
+        // record: both 象棋巫师 and the web adapter are authoritative here.
+        if isWizardTarget || isWebMoveLogTarget {
+            statusMessage = isWizardTarget
+                ? "等待象棋巫师发布第\(game.records.count + 1)步官方记录…"
+                : "等待网页发布第\(game.records.count + 1)步官方记录…"
             return
         }
         switch RecognitionTransitionPolicy.decide(
@@ -2490,9 +3602,9 @@ final class PilotRuntime: ObservableObject {
         presentation.confidence = 1
         presentation.confidenceBasis = "象棋巫师终局公告"
         blockingError = nil
-        statusMessage = "对局结束：(result.title)"
+        statusMessage = "对局结束：\(result.title)"
         presentation.recordEvent(
-            title: "对局结束·(result.title)",
+            title: "对局结束·\(result.title)",
             detail: "已由象棋巫师的终局弹窗确认，窗口操作已自动锁定",
             symbolName: result == .win ? "trophy.fill" : "flag.checkered",
             tone: result == .win ? .success : (result == .draw ? .neutral : .attention)
@@ -2509,10 +3621,16 @@ final class PilotRuntime: ObservableObject {
             Task { @MainActor in
                 if paused {
                     await self.clickExecutor.pause(.userRequested)
+                    await self.gridState.clickExecutor.pause()
                 } else {
                     do {
-                        try await self.clickExecutor.arm()
+                        if self.presentation.selectedGame == .xiangqi {
+                            try await self.clickExecutor.arm()
+                        } else {
+                            try await self.gridState.clickExecutor.arm()
+                        }
                         self.blockingError = nil
+                        self.presentation.safetyNotice = nil
                         self.statusMessage = "已恢复控制，执行前将重新校验棋盘"
                         // The user may choose automatic mode while paused.
                         // Resuming is therefore a new eligibility edge and
@@ -2526,15 +3644,30 @@ final class PilotRuntime: ObservableObject {
         }
         presentation.onEmergencyStop = { [weak self] in
             guard let self else { return }
-            Task { @MainActor in await self.clickExecutor.pause(.manualTakeover) }
+            Task { @MainActor in
+                await self.clickExecutor.pause(.manualTakeover)
+                await self.gridState.clickExecutor.pause()
+            }
         }
         presentation.onResumeAfterStop = { [weak self] in
             guard let self else { return }
-            Task { @MainActor in await self.recognizeCurrentPosition() }
+            Task { @MainActor in
+                if self.presentation.selectedGame == .xiangqi {
+                    await self.recognizeCurrentPosition()
+                } else {
+                    await self.recognizeGridPosition()
+                }
+            }
         }
         presentation.onRecognizePosition = { [weak self] in
             guard let self else { return }
-            Task { @MainActor in await self.recognizeCurrentPosition() }
+            Task { @MainActor in
+                if self.presentation.selectedGame == .xiangqi {
+                    await self.recognizeCurrentPosition()
+                } else {
+                    await self.recognizeGridPosition()
+                }
+            }
         }
         presentation.onApplyCorrection = { [weak self] in
             guard let self else { return }
@@ -2544,9 +3677,32 @@ final class PilotRuntime: ObservableObject {
             guard let self else { return }
             Task { @MainActor in await self.execute(candidate) }
         }
+        presentation.onConcedeCurrentGame = { [weak self] in
+            guard let self else { return }
+            Task { @MainActor in await self.concedeCurrentGridGame() }
+        }
         presentation.onControlModeChanged = { [weak self] _ in
             guard let self else { return }
             Task { @MainActor in self.scheduleAutomaticExecutionIfEligible() }
+        }
+        presentation.onGridSelfPlayChanged = { [weak self] enabled in
+            guard let self else { return }
+            Task { @MainActor in
+                self.gridControlsBothSides = enabled
+                self.gridState.controlsBothSides = enabled
+                self.automaticExecutionToken = nil
+                guard self.setupStep == .ready,
+                      self.presentation.selectedGame != .xiangqi,
+                      self.positionIsTrusted else { return }
+                self.presentation.recordEvent(
+                    title: enabled ? "双方自动自测已开启" : "双方自动自测已关闭",
+                    detail: enabled ? "驾驶舱将对双方依次执行规则校验后的候选落点" : "恢复仅我方落子，等待目标窗口对手回手",
+                    symbolName: enabled ? "arrow.triangle.2.circlepath" : "person.fill",
+                    tone: enabled ? .attention : .neutral
+                )
+                await self.analyzeGridPosition()
+                self.scheduleAutomaticExecutionIfEligible()
+            }
         }
         presentation.onRecover = { [weak self] in
             guard let self else { return }
@@ -2571,12 +3727,17 @@ final class PilotRuntime: ObservableObject {
         presentation.onEditPiece = { [weak self] coordinate, side, glyph in
             self?.editPiece(at: coordinate, side: side, glyph: glyph)
         }
+        presentation.onGameChanged = { [weak self] gameKind in
+            guard let self else { return }
+            Task { @MainActor in await self.changeGameKind(gameKind) }
+        }
     }
 
     private func pause(reason: String) {
         presentation.isPaused = true
         presentation.phase = .observing
         blockingError = reason
+        presentation.safetyNotice = reason
         statusMessage = "已安全暂停：\(reason)"
     }
 

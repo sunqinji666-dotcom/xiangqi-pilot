@@ -24,8 +24,16 @@ struct BoardWorkspace: View {
             .pickerStyle(.segmented)
             .frame(width: 208)
 
-            CapsuleBadge(title: "红方走", color: CockpitPalette.red, symbolName: "circle.fill")
-            CapsuleBadge(title: "\(model.pieces.count) 枚已识别", color: CockpitPalette.green, symbolName: "checkmark.seal.fill")
+            CapsuleBadge(
+                title: model.selectedGame == .xiangqi ? "红方走" : "\(model.selectedGame.title)局面",
+                color: model.selectedGame == .xiangqi ? CockpitPalette.red : CockpitPalette.blue,
+                symbolName: "circle.fill"
+            )
+            CapsuleBadge(
+                title: "\(model.selectedGame == .xiangqi ? model.pieces.count : model.gridStones.count) 枚已识别",
+                color: CockpitPalette.green,
+                symbolName: "checkmark.seal.fill"
+            )
 
             Spacer()
 
@@ -61,13 +69,22 @@ struct BoardWorkspace: View {
                         .resizable()
                         .scaledToFit()
                         .padding(10)
-                } else {
+                } else if model.selectedGame == .xiangqi {
                     XiangqiBoardView(
                         pieces: model.pieces,
                         proposal: model.selectedCandidate,
                         showsRecognitionOverlay: false
                     )
                     .padding(.vertical, 8)
+                } else if let lineCount = model.gridLineCount {
+                    GridBoardView(
+                        lineCount: lineCount,
+                        stones: model.gridStones,
+                        proposal: model.selectedCandidate
+                    )
+                    .padding(18)
+                } else {
+                    ContentUnavailableView("等待识别棋盘", systemImage: "circle.grid.cross")
                 }
 
                 VStack(alignment: .trailing, spacing: 7) {

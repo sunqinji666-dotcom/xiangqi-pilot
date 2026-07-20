@@ -3,6 +3,7 @@ import SwiftUI
 struct InspectorPanel: View {
     @ObservedObject var model: PilotPresentationModel
     let openRecovery: () -> Void
+    @State private var showsConcedeConfirmation = false
 
     var body: some View {
         ScrollView {
@@ -41,10 +42,21 @@ struct InspectorPanel: View {
 
             Text(model.isEmergencyStopped
                  ? "窗口操作已全部禁用，解除锁定后仍需重新识别。"
-                 : "当前\(model.sideToMove == .red ? "红方" : "黑方")走；已锁定目标窗口和棋盘边界。")
+                 : "当前\(model.displayedTurnText)；已锁定目标窗口和棋盘边界。")
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(CockpitPalette.secondaryText)
                 .fixedSize(horizontal: false, vertical: true)
+
+            if let notice = model.safetyNotice, model.isPaused {
+                Label(notice, systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(CockpitPalette.amber)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(CockpitPalette.amber.opacity(0.08))
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            }
 
             HStack(alignment: .center, spacing: 12) {
                 ZStack {
@@ -67,7 +79,7 @@ struct InspectorPanel: View {
                     Text("局面可信度 · \(model.confidenceBasis)")
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(CockpitPalette.primaryText)
-                    Text("棋子 \(model.pieces.count) 枚 · 网格偏差 \(gridDeviationText)")
+                    Text("棋子 \(model.displayedPieceCount) 枚 · 网格偏差 \(gridDeviationText)")
                         .font(.system(size: 10, weight: .medium))
                         .foregroundStyle(CockpitPalette.secondaryText)
                     HStack(spacing: 5) {
@@ -115,6 +127,13 @@ struct InspectorPanel: View {
             }
             .pickerStyle(.segmented)
 
+            if model.selectedGame != .xiangqi {
+                Toggle("双方自动自测", isOn: $model.gridSelfPlayEnabled)
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(CockpitPalette.secondaryText)
+                    .toggleStyle(.switch)
+            }
+
             HStack(alignment: .top, spacing: 7) {
                 Image(systemName: modeSymbol)
                     .font(.system(size: 11, weight: .semibold))
@@ -153,6 +172,31 @@ struct InspectorPanel: View {
                     || model.phase != .previewing
                     ? 0.42 : 1
             )
+
+            if model.selectedGame == .go {
+                Button(role: .destructive) {
+                    showsConcedeConfirmation = true
+                } label: {
+                    Label("结束当前围棋局（认输）", systemImage: "flag.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(
+                    model.isPaused
+                        || model.isEmergencyStopped
+                        || model.phase == .acting
+                        || model.phase == .verifying
+                )
+                .alert("确认在锁定的腾讯围棋窗口中认输？", isPresented: $showsConcedeConfirmation) {
+                    Button("取消", role: .cancel) {}
+                    Button("确认认输", role: .destructive) {
+                        model.concedeCurrentGame()
+                    }
+                } message: {
+                    Text("驾驶舱将只点击已验证的“认输”和确认控件，并等待客户端终局回执。")
+                }
+            }
         }
         .padding(13)
         .cockpitPanel(cornerRadius: 13)

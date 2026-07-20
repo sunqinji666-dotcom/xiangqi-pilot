@@ -38,7 +38,7 @@ enum XiangqiWizardMoveLogReader {
     static func terminalResult(ownerPID: pid_t) -> XiangqiWizardTerminalResult? {
         let application = AXUIElementCreateApplication(ownerPID)
         var descriptions: [String] = []
-        collectDescriptions(from: application, depth: 0, into: &descriptions)
+        collectTerminalText(from: application, depth: 0, into: &descriptions)
         return terminalResult(in: descriptions)
     }
 
@@ -294,6 +294,36 @@ enum XiangqiWizardMoveLogReader {
               let children = rawChildren as? [AXUIElement] else { return }
         for child in children {
             collectDescriptions(from: child, depth: depth + 1, into: &descriptions)
+        }
+    }
+
+    private static func collectTerminalText(
+        from element: AXUIElement,
+        depth: Int,
+        into descriptions: inout [String]
+    ) {
+        guard depth <= 12 else { return }
+        for attribute in [
+            kAXDescriptionAttribute as String,
+            kAXValueAttribute as String,
+            kAXTitleAttribute as String
+        ] {
+            var raw: CFTypeRef?
+            if AXUIElementCopyAttributeValue(element, attribute as CFString, &raw) == .success,
+               let text = raw as? String,
+               !text.isEmpty {
+                descriptions.append(text)
+            }
+        }
+        var rawChildren: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            element,
+            kAXChildrenAttribute as CFString,
+            &rawChildren
+        ) == .success,
+              let children = rawChildren as? [AXUIElement] else { return }
+        for child in children {
+            collectTerminalText(from: child, depth: depth + 1, into: &descriptions)
         }
     }
 

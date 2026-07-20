@@ -10,12 +10,22 @@ struct SetupWizardView: View {
             Divider().overlay(CockpitPalette.border)
 
             Group {
-                switch runtime.setupStep {
-                case .permissions: PermissionsSetupStep(runtime: runtime)
-                case .window: WindowSetupStep(runtime: runtime)
-                case .calibration: CalibrationSetupStep(runtime: runtime)
-                case .position: PositionSetupStep(runtime: runtime)
-                case .ready: EmptyView()
+                if let terminal = runtime.detectedGridTerminal,
+                   runtime.presentation.selectedGame != .xiangqi {
+                    GridTerminalSetupStep(runtime: runtime, terminal: terminal)
+                } else {
+                    switch runtime.setupStep {
+                    case .permissions: PermissionsSetupStep(runtime: runtime)
+                    case .window: WindowSetupStep(runtime: runtime)
+                    case .calibration: CalibrationSetupStep(runtime: runtime)
+                    case .position:
+                        if runtime.presentation.selectedGame == .xiangqi {
+                            PositionSetupStep(runtime: runtime)
+                        } else {
+                            GridPositionSetupStep(runtime: runtime)
+                        }
+                    case .ready: EmptyView()
+                    }
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -47,10 +57,10 @@ struct SetupWizardView: View {
             .frame(width: 44, height: 44)
 
             VStack(alignment: .leading, spacing: 3) {
-                Text("启动中国象棋副驾")
+                Text("启动\(runtime.presentation.selectedGame.title)副驾")
                     .font(.system(size: 18, weight: .bold))
                     .foregroundStyle(CockpitPalette.primaryText)
-                Text("只绑定你选中的窗口，每步落子都经过视觉复核")
+                Text("只绑定你选中的窗口，每步落子都经过规则与视觉复核")
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(CockpitPalette.secondaryText)
             }
@@ -100,6 +110,38 @@ struct SetupWizardView: View {
         .padding(.horizontal, 22)
         .frame(height: 52)
         .background(CockpitPalette.sidebar)
+    }
+}
+
+private struct GridTerminalSetupStep: View {
+    @ObservedObject var runtime: PilotRuntime
+    let terminal: GridTerminalResult
+
+    var body: some View {
+        VStack(spacing: 18) {
+            Spacer()
+            Image(systemName: terminal == .win ? "trophy.fill" : "flag.checkered")
+                .font(.system(size: 42, weight: .bold))
+                .foregroundStyle(terminal == .win ? CockpitPalette.green : CockpitPalette.amber)
+            Text("已确认\(runtime.presentation.selectedGame.title)终局：\(terminal.title)")
+                .font(.system(size: 22, weight: .bold))
+                .foregroundStyle(CockpitPalette.primaryText)
+            Text("终局浮层已由驾驶舱读取，自动操作已锁定。可返回窗口选择并通过驾驶舱启动下一盘。")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(CockpitPalette.secondaryText)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 560)
+            Button {
+                runtime.detectedGridTerminal = nil
+                Task { await runtime.refreshWindows() }
+            } label: {
+                Label("选择下一局目标", systemImage: "arrow.counterclockwise")
+                    .frame(width: 200)
+            }
+            .buttonStyle(CockpitActionButtonStyle(color: CockpitPalette.cyan))
+            Spacer()
+        }
+        .padding(28)
     }
 }
 
@@ -210,7 +252,7 @@ private struct WindowSetupStep: View {
         VStack(alignment: .leading, spacing: 14) {
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("选择正在运行的象棋窗口")
+                    Text("选择正在运行的\(runtime.presentation.selectedGame.title)窗口")
                         .font(.system(size: 19, weight: .bold))
                         .foregroundStyle(CockpitPalette.primaryText)
                     Text("程序只会绑定一个具体 windowID，不会监看整个桌面。")
@@ -225,6 +267,16 @@ private struct WindowSetupStep: View {
                 }
                 .buttonStyle(SecondaryActionButtonStyle())
             }
+
+            Picker("棋种", selection: Binding(
+                get: { runtime.presentation.selectedGame },
+                set: { runtime.presentation.selectedGame = $0 }
+            )) {
+                ForEach(GameKind.allCases) { game in
+                    Text(game.title).tag(game)
+                }
+            }
+            .pickerStyle(.segmented)
 
             ScrollView {
                 LazyVStack(spacing: 8) {
@@ -275,7 +327,7 @@ private struct WindowSetupStep: View {
                 ContentUnavailableView(
                     "没有可选窗口",
                     systemImage: "macwindow.badge.plus",
-                    description: Text("请先打开一个象棋程序或网页，然后刷新。")
+                    description: Text("请先打开目标棋局程序，然后刷新。")
                 )
             }
         }
@@ -293,11 +345,30 @@ private struct CalibrationSetupStep: View {
                     Text("标定棋盘四角")
                         .font(.system(size: 19, weight: .bold))
                         .foregroundStyle(CockpitPalette.primaryText)
-                    Text("将四个青色控制点拖到 9×10 棋盘的最外侧交叉点。")
+                    Text("将四个青色控制点拖到\(runtime.presentation.selectedGame.gridLineCount.map { "\($0)×\($0)" } ?? "9×10")棋盘的最外侧交叉点。")
                         .font(.system(size: 11, weight: .medium))
                         .foregroundStyle(CockpitPalette.secondaryText)
                 }
                 Spacer()
+                if runtime.presentation.selectedGame != .xiangqi {
+                    Button {
+                        Task { await runtime.startSelectedGridGame() }
+                    } label: {
+                        Label(runtime.selectedGridBootstrapTitle, systemImage: "play.circle.fill")
+                    }
+                    .buttonStyle(SecondaryActionButtonStyle())
+                    .disabled(runtime.isBusy)
+                }
+                if runtime.presentation.selectedGame == .go,
+                   runtime.tencentPaidMatchConfirmationPending {
+                    Button {
+                        Task { await runtime.confirmTencentPaidMatchAndStart() }
+                    } label: {
+                        Label("确认消耗 15 万金币并开始", systemImage: "checkmark.shield.fill")
+                    }
+                    .buttonStyle(CockpitActionButtonStyle(color: CockpitPalette.amber))
+                    .disabled(runtime.isBusy)
+                }
                 CapsuleBadge(title: "仅棋盘 ROI", color: CockpitPalette.green, symbolName: "lock.shield.fill")
             }
 
@@ -386,6 +457,12 @@ private struct PositionSetupStep: View {
                 Picker("下一手", selection: $runtime.sideToMove) {
                     Text("红方走").tag(Side.red)
                     Text("黑方走").tag(Side.black)
+                }
+                .pickerStyle(.segmented)
+
+                Picker("我方执棋", selection: $runtime.xiangqiControlledSide) {
+                    Text("我方红").tag(Side.red)
+                    Text("我方黑").tag(Side.black)
                 }
                 .pickerStyle(.segmented)
 
@@ -484,5 +561,92 @@ private struct PositionSetupStep: View {
             .cockpitPanel(cornerRadius: 14, raised: true)
         }
         .padding(20)
+    }
+}
+
+private struct GridPositionSetupStep: View {
+    @ObservedObject var runtime: PilotRuntime
+
+    var body: some View {
+        HStack(spacing: 18) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("确认\(runtime.presentation.selectedGame.title)局面")
+                            .font(.system(size: 18, weight: .bold))
+                            .foregroundStyle(CockpitPalette.primaryText)
+                        Text("黑白子由本地色彩识别，并先通过规则手数校验。")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(CockpitPalette.secondaryText)
+                    }
+                    Spacer()
+                    CapsuleBadge(
+                        title: runtime.positionIsTrusted ? "可信局面" : "等待校正",
+                        color: runtime.positionIsTrusted ? CockpitPalette.green : CockpitPalette.amber,
+                        symbolName: runtime.positionIsTrusted ? "checkmark.seal.fill" : "exclamationmark.triangle.fill"
+                    )
+                }
+
+                GridBoardView(
+                    lineCount: runtime.presentation.gridLineCount ?? runtime.presentation.selectedGame.gridLineCount ?? 15,
+                    stones: runtime.presentation.gridStones,
+                    proposal: .unavailable
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(12)
+                .background(Color.black.opacity(0.30))
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+
+                HStack {
+                    Text("我方执棋")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(CockpitPalette.secondaryText)
+                    Picker("我方执棋", selection: $runtime.gridControlledSide) {
+                        Text("黑方").tag(GridStone.black)
+                        Text("白方").tag(GridStone.white)
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(width: 180)
+                    Toggle("双方自动自测", isOn: $runtime.gridControlsBothSides)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(CockpitPalette.secondaryText)
+                    Spacer()
+                    Text("下一手：\(runtime.gridSideToMove == .black ? "黑方" : "白方")")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(CockpitPalette.primaryText)
+                }
+            }
+            .frame(maxWidth: .infinity)
+
+            VStack(alignment: .leading, spacing: 14) {
+                Text("局面信息")
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundStyle(CockpitPalette.primaryText)
+                KeyValueRow(key: "棋种", value: runtime.presentation.selectedGame.title)
+                KeyValueRow(key: "交点", value: "\(runtime.presentation.gridLineCount ?? 0) 路")
+                KeyValueRow(key: "已识别", value: "\(runtime.presentation.gridStones.count) 枚")
+                KeyValueRow(key: "置信度", value: runtime.presentation.confidenceText, valueColor: CockpitPalette.green)
+
+                Spacer()
+                Button {
+                    Task { await runtime.recognizeGridPosition() }
+                } label: {
+                    Label("重新识别", systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(SecondaryActionButtonStyle())
+
+                Button {
+                    Task { await runtime.completeSetup() }
+                } label: {
+                    Label("进入棋局驾驶舱", systemImage: "arrow.right.circle.fill")
+                }
+                .buttonStyle(CockpitActionButtonStyle(color: CockpitPalette.cyan))
+                .disabled(!runtime.positionIsTrusted)
+            }
+            .padding(16)
+            .frame(width: 278)
+            .cockpitPanel(cornerRadius: 14, raised: true)
+        }
+        .padding(22)
     }
 }

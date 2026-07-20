@@ -754,6 +754,38 @@ actor ClickExecutor {
         }
     }
 
+    /// Completes a pending click using a target application's authoritative,
+    /// rule-validated move record.  This route is intentionally narrower than
+    /// visual verification: callers must first prove that the exact expected
+    /// move appeared in the target's own score and that it was legal from the
+    /// pre-click position.  It is for asynchronous web boards where the DOM
+    /// record and painted pixels do not commit in the same frame.
+    func verifyAuthoritativeMoveRecord(
+        _ receipt: ClickExecutionReceipt,
+        afterBoardStateHash: String
+    ) throws -> ClickVerification {
+        guard pendingReceipt?.actionID == receipt.actionID,
+              case .awaitingVerification(receipt.actionID) = state else {
+            throw ClickExecutorError.noMatchingPendingReceipt
+        }
+        guard !afterBoardStateHash.isEmpty,
+              afterBoardStateHash != receipt.beforeBoardStateHash else {
+            throw ClickExecutorError.verificationBoardStateUnchanged
+        }
+
+        let verification = ClickVerification(
+            actionID: receipt.actionID,
+            beforeFrameSequence: receipt.beforeFrameSequence,
+            afterFrameSequence: receipt.minimumVerificationFrameSequence,
+            afterFrameFingerprint: receipt.beforeFrameFingerprint,
+            afterBoardStateHash: afterBoardStateHash,
+            verifiedAtUptime: ProcessInfo.processInfo.systemUptime
+        )
+        pendingReceipt = nil
+        state = .armed
+        return verification
+    }
+
     private func validateBeforeClick(
         frame: CapturedFrame,
         binding: ClickActionBinding,

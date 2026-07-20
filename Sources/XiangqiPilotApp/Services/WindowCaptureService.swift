@@ -1,4 +1,5 @@
 @preconcurrency import ScreenCaptureKit
+import AppKit
 import CoreGraphics
 import CoreImage
 import CoreMedia
@@ -6,6 +7,12 @@ import CoreVideo
 import Foundation
 
 actor WindowCaptureService {
+    private struct WindowMetadata {
+        let ownerPID: pid_t
+        let bundleIdentifier: String?
+        let applicationName: String
+    }
+
     private let output = StreamFrameOutput()
     private let sampleQueue = DispatchQueue(
         label: "com.jacksun.xiangqi-pilot.screen-capture",
@@ -13,8 +20,34 @@ actor WindowCaptureService {
     )
 
     private var availableSCWindows: [CGWindowID: SCWindow] = [:]
+    private var availableDescriptors: [CGWindowID: CapturableWindow] = [:]
     private var stream: SCStream?
     private var target: LockedCaptureTarget?
+
+    private static func fallbackWindowMetadata() -> [CGWindowID: WindowMetadata] {
+        guard let rawWindows = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements],
+            kCGNullWindowID
+        ) as? [[String: Any]] else {
+            return [:]
+        }
+
+        return rawWindows.reduce(into: [:]) { result, details in
+            guard let number = details[kCGWindowNumber as String] as? NSNumber,
+                  let pidNumber = details[kCGWindowOwnerPID as String] as? NSNumber,
+                  let ownerName = details[kCGWindowOwnerName as String] as? String else {
+                return
+            }
+
+            let ownerPID = pid_t(pidNumber.int32Value)
+            let application = NSRunningApplication(processIdentifier: ownerPID)
+            result[CGWindowID(number.uint32Value)] = WindowMetadata(
+                ownerPID: ownerPID,
+                bundleIdentifier: application?.bundleIdentifier,
+                applicationName: application?.localizedName ?? ownerName
+            )
+        }
+    }
 
     /// Lists only currently visible windows. The returned descriptor is safe to
     /// keep in UI state; the underlying SCWindow is retained privately and must
@@ -30,6 +63,8 @@ actor WindowCaptureService {
         )
 
         var cache: [CGWindowID: SCWindow] = [:]
+        var descriptorCache: [CGWindowID: CapturableWindow] = [:]
+        let fallbackMetadata = Self.fallbackWindowMetadata()
         let ignoredBundleIdentifiers: Set<String> = [
             "com.apple.controlcenter",
             "com.apple.systemuiserver",
@@ -40,25 +75,48 @@ actor WindowCaptureService {
         let ignoredTitles: Set<String> = ["Menubar", "StatusIndicator", "Dock"]
 
         let descriptors = content.windows.compactMap { window -> CapturableWindow? in
-            guard let application = window.owningApplication,
-                  window.frame.width >= 320,
+            guard window.frame.width >= 320,
                   window.frame.height >= 220,
-                  !ignoredBundleIdentifiers.contains(application.bundleIdentifier),
                   !ignoredTitles.contains(window.title ?? "") else {
                 return nil
             }
+
+            // Some iOS-on-Mac clients (including the installed 五子棋 app)
+            // expose a capturable SCWindow but no owningApplication.  Do not
+            // silently discard that window: resolve its PID/name from the
+            // CoreGraphics window list, then keep using the same concrete
+            // SCWindow for the stream itself.
+            let metadata: WindowMetadata
+            if let application = window.owningApplication {
+                metadata = WindowMetadata(
+                    ownerPID: application.processID,
+                    bundleIdentifier: application.bundleIdentifier,
+                    applicationName: application.applicationName
+                )
+            } else if let fallback = fallbackMetadata[window.windowID] {
+                metadata = fallback
+            } else {
+                return nil
+            }
+
+            guard !ignoredBundleIdentifiers.contains(metadata.bundleIdentifier ?? "") else {
+                return nil
+            }
             cache[window.windowID] = window
-            return CapturableWindow(
+            let descriptor = CapturableWindow(
                 windowID: window.windowID,
-                ownerPID: application.processID,
-                bundleIdentifier: application.bundleIdentifier,
-                applicationName: application.applicationName,
+                ownerPID: metadata.ownerPID,
+                bundleIdentifier: metadata.bundleIdentifier,
+                applicationName: metadata.applicationName,
                 title: window.title ?? "",
                 frame: window.frame
             )
+            descriptorCache[window.windowID] = descriptor
+            return descriptor
         }
 
         availableSCWindows = cache
+        availableDescriptors = descriptorCache
         return descriptors.sorted {
             if $0.applicationName == $1.applicationName {
                 return $0.title.localizedStandardCompare($1.title) == .orderedAscending
@@ -81,8 +139,8 @@ actor WindowCaptureService {
         guard let window = availableSCWindows[windowID] else {
             throw WindowCaptureError.windowNotFound(windowID)
         }
-        guard let application = window.owningApplication else {
-            throw WindowCaptureError.windowHasNoOwningApplication(windowID)
+        guard let descriptor = availableDescriptors[windowID] else {
+            throw WindowCaptureError.windowNotFound(windowID)
         }
         guard window.frame.width > 1, window.frame.height > 1 else {
             throw WindowCaptureError.invalidWindowSize
@@ -92,9 +150,9 @@ actor WindowCaptureService {
 
         let lockedTarget = LockedCaptureTarget(
             windowID: window.windowID,
-            ownerPID: application.processID,
-            bundleIdentifier: application.bundleIdentifier,
-            applicationName: application.applicationName,
+            ownerPID: descriptor.ownerPID,
+            bundleIdentifier: descriptor.bundleIdentifier,
+            applicationName: descriptor.applicationName,
             title: window.title ?? "",
             frameAtLock: window.frame
         )

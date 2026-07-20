@@ -5,6 +5,11 @@ import XiangqiCore
 @testable import XiangqiPilotApp
 
 @Suite struct CalibrationAndSafetyTests {
+    @Test func kuanliBoardOrientationPresetUsesRedAtTop() {
+        #expect(BoardOrientation.preset(for: "com.cronlygames.chschess.mac") == .redAtTop)
+        #expect(BoardOrientation.preset(for: "com.jpcxc.xqwiphone") == nil)
+    }
+
     @Test func calibrationMapsEveryBoardCornerIntoTheLockedWindow() throws {
         let calibration = try BoardCalibration(
             corners: BoardCorners(
@@ -617,6 +622,66 @@ import XiangqiCore
         #expect(XiangqiWizardMoveLogReader.terminalResult(in: [
             "提和", "认输", "悔棋"
         ]) == nil)
+    }
+
+    @Test func webMoveLogParsesICCSWithoutUsingOCR() throws {
+        let text = """
+        === Start ===
+         1.B2-E2
+           B9-C7
+         2.I3-I4
+           A9-B9
+        """
+        #expect(XiangqiWebMoveLogReader.iccsNotations(in: text) == [
+            "B2-E2", "B9-C7", "I3-I4", "A9-B9"
+        ])
+        #expect(XiangqiWebMoveLogReader.move(fromICCS: "B2-E2")?.ucci == "b2e2")
+        #expect(XiangqiWebMoveLogReader.move(fromICCS: "I3-I4")?.ucci == "i3i4")
+    }
+
+    @Test func webMoveLogKeepsEveryChromeOneRowPerMoveEntry() {
+        // Chrome's current accessibility tree exposes each list-box row as a
+        // distinct value instead of putting the whole score in one value.
+        // Do not collapse that representation to its first single move.
+        let rows = [
+            "=== Start ===",
+            " 1.B2-E2", "   B9-C7",
+            " 2.I3-I4", "   A9-B9",
+            " 3.G3-G4", "   H9-I7"
+        ]
+        #expect(XiangqiWebMoveLogReader.recordedNotations(from: rows) == [
+            "B2-E2", "B9-C7", "I3-I4", "A9-B9", "G3-G4", "H9-I7"
+        ])
+    }
+
+    @Test func webMoveLogReplaysTheObservedPageOpeningUnderCoreRules() throws {
+        let pageMoves = [
+            "B2-E2", "B9-C7", "I3-I4", "A9-B9",
+            "G3-G4", "H9-I7", "E3-E4", "H7-E7",
+            "C3-C4", "I9-H9", "A3-A4", "E7-E4",
+            "F0-E1", "H9-H2", "I4-I5", "I6-I5",
+            "G4-G5", "H2-H1"
+        ]
+        var position = Position.standard
+        for notation in pageMoves {
+            let move = try #require(XiangqiWebMoveLogReader.move(fromICCS: notation))
+            position = try position.applying(move)
+        }
+        #expect(position.sideToMove == .red)
+        // The recorded web line contains two captures, including the cannon
+        // exchange on the central file.
+        #expect(position.board.pieceCount() == 29)
+    }
+
+    @Test func webAdapterOnlyClaimsItsKnownBrowserPage() {
+        #expect(XiangqiWebMoveLogReader.matches(
+            bundleIdentifier: "com.google.Chrome",
+            windowTitle: "Play Chinese Chess Online"
+        ))
+        #expect(!XiangqiWebMoveLogReader.matches(
+            bundleIdentifier: "com.google.Chrome",
+            windowTitle: "Xiangqi - PlayOK"
+        ))
     }
 
     @Test func standardOpeningCanRecoverFromWrongPieceColoursButRejectsMovedKind() throws {

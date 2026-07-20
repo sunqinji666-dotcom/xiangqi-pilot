@@ -11,6 +11,10 @@ struct PilotDiagnostic: Equatable, Sendable {
             source = "ClickExecutor"
             code = clickError.diagnosticCode
             message = clickError.localizedDescription
+        } else if let gridClickError = error as? GridClickExecutorError {
+            source = "GridClickExecutor"
+            code = gridClickError.diagnosticCode
+            message = gridClickError.localizedDescription
         } else {
             source = "PilotRuntime"
             code = "operationFailed"
@@ -20,6 +24,24 @@ struct PilotDiagnostic: Equatable, Sendable {
 
     var displayText: String {
         "[\(source).\(code)] \(message)"
+    }
+}
+
+extension GridClickExecutorError {
+    var diagnosticCode: String {
+        switch self {
+        case .notArmed: "notArmed"
+        case .actionInFlight: "actionInFlight"
+        case .permissionMissing: "permissionMissing"
+        case .targetMissing: "targetMissing"
+        case .targetNotFrontmost: "targetNotFrontmost"
+        case .targetChanged: "targetChanged"
+        case .geometryChanged: "geometryChanged"
+        case .staleFrame: "staleFrame"
+        case .pointOutsideTarget: "pointOutsideTarget"
+        case .eventCreationFailed: "eventCreationFailed"
+        case .verificationUnchanged: "verificationUnchanged"
+        }
     }
 }
 

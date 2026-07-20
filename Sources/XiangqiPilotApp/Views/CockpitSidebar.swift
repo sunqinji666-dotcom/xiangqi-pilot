@@ -30,13 +30,19 @@ struct CockpitSidebar: View {
 
             VStack(alignment: .leading, spacing: 10) {
                 SectionLabel(title: "当前棋局", detail: "实时")
-                KeyValueRow(key: "执棋方", value: "红方", valueColor: CockpitPalette.red)
+                KeyValueRow(
+                    key: "当前执棋",
+                    value: model.displayedTurnText.replacingOccurrences(of: "走", with: ""),
+                    valueColor: model.selectedGame == .xiangqi && model.sideToMove == .red
+                        ? CockpitPalette.red
+                        : CockpitPalette.primaryText
+                )
                 KeyValueRow(
                     key: "当前轮次",
-                    value: model.sideToMove == .red ? "红方走" : "黑方走"
+                    value: model.displayedTurnText
                 )
-                KeyValueRow(key: "规则", value: "标准象棋")
-                KeyValueRow(key: "棋子", value: "\(model.pieces.count) 枚")
+                KeyValueRow(key: "规则", value: model.displayedRuleText)
+                KeyValueRow(key: "棋子", value: "\(model.displayedPieceCount) 枚")
             }
             .padding(12)
             .cockpitPanel(cornerRadius: 12, raised: true)

@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import Foundation
+import XiangqiCore
 
 // MARK: - Navigation and session presentation
 
@@ -22,7 +23,8 @@ enum GameKind: String, CaseIterable, Identifiable {
     var subtitle: String {
         switch self {
         case .xiangqi: "标准九路棋盘"
-        case .go, .gomoku: "即将推出"
+        case .go: "19路交点棋盘"
+        case .gomoku: "15路连五棋盘"
         }
     }
 
@@ -34,7 +36,15 @@ enum GameKind: String, CaseIterable, Identifiable {
         }
     }
 
-    var isAvailable: Bool { self == .xiangqi }
+    var isAvailable: Bool { true }
+
+    var gridLineCount: Int? {
+        switch self {
+        case .xiangqi: nil
+        case .gomoku: 15
+        case .go: 19
+        }
+    }
 }
 
 enum WorkspaceDestination: String, CaseIterable, Identifiable {
@@ -157,6 +167,13 @@ struct BoardPiece: Identifiable, Hashable {
     }
 }
 
+struct GridStonePiece: Identifiable, Hashable {
+    let side: GridStone
+    let coordinate: GridCoordinate
+
+    var id: String { "\(side.rawValue)-\(coordinate.column)-\(coordinate.row)" }
+}
+
 struct CandidateMove: Identifiable, Hashable {
     let id: String
     let notation: String
@@ -242,7 +259,12 @@ struct PositionRecoveryDifference: Identifiable, Hashable {
 // MARK: - Pure UI state
 
 final class PilotPresentationModel: ObservableObject {
-    @Published var selectedGame: GameKind
+    @Published var selectedGame: GameKind {
+        didSet {
+            guard selectedGame != oldValue else { return }
+            onGameChanged?(selectedGame)
+        }
+    }
     @Published var activeWorkspace: WorkspaceDestination
     @Published var previewMode: PreviewMode
     @Published var phase: PilotPhase
@@ -268,10 +290,29 @@ final class PilotPresentationModel: ObservableObject {
     @Published var modelSessionCostCNY: Double
     @Published var isPaused: Bool
     @Published var isEmergencyStopped: Bool
+    /// The exact reason for a safe pause belongs in the cockpit, not only in
+    /// an internal log. It prevents the operator from having to guess why a
+    /// move did not proceed.
+    @Published var safetyNotice: String?
     @Published var events: [TimelineEvent]
 
     @Published var source: WindowSource
     @Published var pieces: [BoardPiece]
+    @Published var gridLineCount: Int?
+    @Published var gridStones: [GridStonePiece]
+    /// Grid games keep their turn independently from Xiangqi's red/black
+    /// position.  Publishing it with the same snapshot prevents the cockpit
+    /// chrome from showing stale Xiangqi labels beside a live Go/Gomoku board.
+    @Published var gridSideToMove: GridStone = .black
+    /// Explicit self-play is useful for end-to-end verification against a
+    /// local board client that does not itself provide an AI reply. It stays
+    /// opt-in and is surfaced as “双方自动自测” in the cockpit.
+    @Published var gridSelfPlayEnabled = false {
+        didSet {
+            guard gridSelfPlayEnabled != oldValue else { return }
+            onGridSelfPlayChanged?(gridSelfPlayEnabled)
+        }
+    }
     @Published var sideToMove: XiangqiSide
     @Published var candidates: [CandidateMove]
     @Published var liveImage: NSImage?
@@ -296,13 +337,16 @@ final class PilotPresentationModel: ObservableObject {
     var onRecognizePosition: (() -> Void)?
     var onApplyCorrection: (() -> Void)?
     var onConfirmMove: ((CandidateMove) -> Void)?
+    var onConcedeCurrentGame: (() -> Void)?
     var onControlModeChanged: ((ControlMode) -> Void)?
+    var onGridSelfPlayChanged: ((Bool) -> Void)?
     var onRecover: (() -> Void)?
     var onBeginRecovery: (() -> Void)?
     var onApplyRecoveryCandidate: (() -> Void)?
     var onDiscardRecoveryCandidate: (() -> Void)?
     var onEngineSourceChanged: ((EngineSource) -> Void)?
     var onEditPiece: ((BoardCoordinate, XiangqiSide?, String?) -> Void)?
+    var onGameChanged: ((GameKind) -> Void)?
 
     var selectedCandidate: CandidateMove {
         candidates.first(where: { $0.id == selectedCandidateID }) ?? candidates.first ?? .unavailable
@@ -326,6 +370,25 @@ final class PilotPresentationModel: ObservableObject {
         confidence.formatted(.percent.precision(.fractionLength(1)))
     }
 
+    var displayedPieceCount: Int {
+        selectedGame == .xiangqi ? pieces.count : gridStones.count
+    }
+
+    var displayedTurnText: String {
+        if selectedGame == .xiangqi {
+            return sideToMove == .red ? "红方走" : "黑方走"
+        }
+        return gridSideToMove == .black ? "黑方走" : "白方走"
+    }
+
+    var displayedRuleText: String {
+        switch selectedGame {
+        case .xiangqi: "标准象棋"
+        case .go: "19路围棋"
+        case .gomoku: "15路连五棋"
+        }
+    }
+
     init(
         selectedGame: GameKind = .xiangqi,
         activeWorkspace: WorkspaceDestination = .cockpit,
@@ -343,12 +406,17 @@ final class PilotPresentationModel: ObservableObject {
         modelSessionCostCNY: Double = 0,
         isPaused: Bool = false,
         isEmergencyStopped: Bool = false,
+        safetyNotice: String? = nil,
         source: WindowSource,
         pieces: [BoardPiece],
         sideToMove: XiangqiSide = .red,
         candidates: [CandidateMove],
         events: [TimelineEvent],
-        liveImage: NSImage? = nil
+        liveImage: NSImage? = nil,
+        gridLineCount: Int? = nil,
+        gridStones: [GridStonePiece] = [],
+        gridSideToMove: GridStone = .black,
+        gridSelfPlayEnabled: Bool = false
     ) {
         self.selectedGame = selectedGame
         self.activeWorkspace = activeWorkspace
@@ -366,8 +434,13 @@ final class PilotPresentationModel: ObservableObject {
         self.modelSessionCostCNY = modelSessionCostCNY
         self.isPaused = isPaused
         self.isEmergencyStopped = isEmergencyStopped
+        self.safetyNotice = safetyNotice
         self.source = source
         self.pieces = pieces
+        self.gridLineCount = gridLineCount
+        self.gridStones = gridStones
+        self.gridSideToMove = gridSideToMove
+        self.gridSelfPlayEnabled = gridSelfPlayEnabled
         self.sideToMove = sideToMove
         self.candidates = candidates
         self.events = events
@@ -486,6 +559,11 @@ final class PilotPresentationModel: ObservableObject {
         )
         phase = .verifying
         onConfirmMove?(selectedCandidate)
+    }
+
+    func concedeCurrentGame() {
+        guard selectedGame == .go, !isEmergencyStopped else { return }
+        onConcedeCurrentGame?()
     }
 
     func markRecovered() {
