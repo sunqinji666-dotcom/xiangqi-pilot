@@ -2482,7 +2482,10 @@ final class PilotRuntime: ObservableObject {
         await modelGateway.register(
             OpenAICompatibleProvider(configuration: AlibabaBailianConfiguration.plus)
         )
-        presentation.modelSource = .cloud
+        // Register the Alibaba providers for explicit opt-in, but do not
+        // silently enable cloud vision on launch. Local recognition remains
+        // the default and avoids an unexpected paid/slow recovery call.
+        presentation.modelSource = .off
     }
 
     private func recognizePositionWithAlibabaModel(
