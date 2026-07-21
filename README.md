@@ -1,5 +1,7 @@
 <div align="center">
 
+![xiangqi-pilot project visual](docs/assets/xiangqi-pilot-hero.png)
+
 # XiangqiPilot
 
 ### 让电脑看懂棋盘，也让每一步操作都先想清楚、再动手
