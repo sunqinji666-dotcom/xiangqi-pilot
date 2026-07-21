@@ -46,6 +46,14 @@ struct TopCommandBar: View {
                 .frame(maxWidth: .infinity)
 
             HStack(spacing: 9) {
+                Button {
+                    model.returnHome()
+                } label: {
+                    Label("返回首页", systemImage: "house.fill")
+                }
+                .buttonStyle(SecondaryActionButtonStyle())
+                .keyboardShortcut("h", modifiers: [.command, .shift])
+
                 if model.isEmergencyStopped {
                     Button {
                         model.resumeAfterStop()

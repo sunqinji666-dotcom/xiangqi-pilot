@@ -76,8 +76,24 @@ struct ClickActionBinding: Sendable {
 }
 
 struct XiangqiClickMove: Hashable, Sendable {
+    enum DispatchRoute: Hashable, Sendable {
+        case globalHID
+        case targetProcess
+    }
+
     let source: XiangqiGridPoint
     let destination: XiangqiGridPoint
+    let dispatchRoute: DispatchRoute
+
+    init(
+        source: XiangqiGridPoint,
+        destination: XiangqiGridPoint,
+        dispatchRoute: DispatchRoute = .globalHID
+    ) {
+        self.source = source
+        self.destination = destination
+        self.dispatchRoute = dispatchRoute
+    }
 }
 
 struct ClickExecutionReceipt: Hashable, Sendable {
@@ -183,7 +199,7 @@ actor ClickExecutor {
     private let mouseDownDurationNanoseconds: UInt64
     private let sourceToDestinationDelayNanoseconds: UInt64
 
-    init(mouseDownMilliseconds: UInt64 = 18, sourceToDestinationDelayMilliseconds: UInt64 = 120) {
+    init(mouseDownMilliseconds: UInt64 = 22, sourceToDestinationDelayMilliseconds: UInt64 = 260) {
         mouseDownDurationNanoseconds = mouseDownMilliseconds * 1_000_000
         sourceToDestinationDelayNanoseconds = sourceToDestinationDelayMilliseconds * 1_000_000
     }
@@ -619,7 +635,13 @@ actor ClickExecutor {
                 windowID: binding.windowID
             )
 
-            try await postClick(at: sourcePoint, actionID: actionID, epoch: epoch)
+            try await postClick(
+                at: sourcePoint,
+                ownerPID: binding.ownerPID,
+                route: move.dispatchRoute,
+                actionID: actionID,
+                epoch: epoch
+            )
             try await Task.sleep(nanoseconds: sourceToDestinationDelayNanoseconds)
             try ensureStillExecuting(actionID: actionID, epoch: epoch)
 
@@ -648,7 +670,13 @@ actor ClickExecutor {
             ) else {
                 throw ClickExecutorError.targetWindowOccluded
             }
-            try await postClick(at: destinationPoint, actionID: actionID, epoch: epoch)
+            try await postClick(
+                at: destinationPoint,
+                ownerPID: binding.ownerPID,
+                route: move.dispatchRoute,
+                actionID: actionID,
+                epoch: epoch
+            )
 
             let receipt = ClickExecutionReceipt(
                 actionID: actionID,
@@ -822,7 +850,7 @@ actor ClickExecutor {
             let boardChange = boardDifferencer.changes(
                 from: binding.boardVisualSignature,
                 to: currentBoardSignature,
-                minimumScore: 0.035
+                minimumScore: 0.07
             )
             guard boardChange.cells.isEmpty else {
                 throw ClickExecutorError.frameContentChanged
@@ -840,7 +868,7 @@ actor ClickExecutor {
             let boardChange = boardDifferencer.changes(
                 from: binding.boardVisualSignature,
                 to: currentBoardSignature,
-                minimumScore: 0.035
+                minimumScore: 0.07
             )
             guard boardChange.cells.isEmpty else {
                 throw ClickExecutorError.frameNotStable
@@ -946,12 +974,24 @@ actor ClickExecutor {
         }
     }
 
-    private func postClick(at point: CGPoint, actionID: UUID, epoch: UInt64) async throws {
+    private func postClick(
+        at point: CGPoint,
+        ownerPID: pid_t,
+        route: XiangqiClickMove.DispatchRoute,
+        actionID: UUID,
+        epoch: UInt64
+    ) async throws {
         try ensureStillExecuting(actionID: actionID, epoch: epoch)
         guard MacPermissionsService.accessibilityStatus == .granted else {
             throw ClickExecutorError.accessibilityPermissionMissing
         }
         guard let source = CGEventSource(stateID: .hidSystemState),
+              let mouseMoved = CGEvent(
+                mouseEventSource: source,
+                mouseType: .mouseMoved,
+                mouseCursorPosition: point,
+                mouseButton: .left
+              ),
               let mouseDown = CGEvent(
                 mouseEventSource: source,
                 mouseType: .leftMouseDown,
@@ -968,20 +1008,37 @@ actor ClickExecutor {
         }
 
         let eventSignature = Int64(bitPattern: 0x5849_414e_4751_4950)
+        mouseMoved.setIntegerValueField(.eventSourceUserData, value: eventSignature)
         mouseDown.setIntegerValueField(.eventSourceUserData, value: eventSignature)
         mouseUp.setIntegerValueField(.eventSourceUserData, value: eventSignature)
 
-        mouseDown.post(tap: .cghidEventTap)
+        post(mouseMoved, route: route, ownerPID: ownerPID)
+        try await Task.sleep(for: .milliseconds(45))
+        try ensureStillExecuting(actionID: actionID, epoch: epoch)
+        post(mouseDown, route: route, ownerPID: ownerPID)
         do {
             try await Task.sleep(nanoseconds: mouseDownDurationNanoseconds)
         } catch {
             // Always release the button, even when cancellation/manual takeover
             // arrives while it is down.
-            mouseUp.post(tap: .cghidEventTap)
+            post(mouseUp, route: route, ownerPID: ownerPID)
             throw error
         }
-        mouseUp.post(tap: .cghidEventTap)
+        post(mouseUp, route: route, ownerPID: ownerPID)
         try ensureStillExecuting(actionID: actionID, epoch: epoch)
+    }
+
+    private func post(
+        _ event: CGEvent,
+        route: XiangqiClickMove.DispatchRoute,
+        ownerPID: pid_t
+    ) {
+        switch route {
+        case .globalHID:
+            event.post(tap: .cghidEventTap)
+        case .targetProcess:
+            event.postToPid(ownerPID)
+        }
     }
 
     /// Activates an already verified, unobscured target by clicking only its

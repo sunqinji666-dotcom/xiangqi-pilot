@@ -1,3 +1,4 @@
+import AppKit
 import CoreGraphics
 import Foundation
 import Testing
@@ -8,6 +9,117 @@ import XiangqiCore
     @Test func kuanliBoardOrientationPresetUsesRedAtTop() {
         #expect(BoardOrientation.preset(for: "com.cronlygames.chschess.mac") == .redAtTop)
         #expect(BoardOrientation.preset(for: "com.jpcxc.xqwiphone") == nil)
+    }
+
+    @Test func kuanliCanReconcileWhileCockpitIsFrontmost() {
+        #expect(BackgroundVisualReconciliationPolicy.allows(
+            bundleIdentifier: "com.cronlygames.chschess.mac"
+        ))
+        #expect(!BackgroundVisualReconciliationPolicy.allows(
+            bundleIdentifier: "com.jpcxc.xqwiphone"
+        ))
+        #expect(!BackgroundVisualReconciliationPolicy.allows(bundleIdentifier: nil))
+    }
+
+    @Test func kuanliAutomaticTargetPolicyDoesNotApplyToOtherClients() {
+        #expect(BackgroundVisualReconciliationPolicy.allows(
+            bundleIdentifier: "com.cronlygames.chschess.mac"
+        ))
+        #expect(!BackgroundVisualReconciliationPolicy.allows(
+            bundleIdentifier: "com.ppclink.chessmaster"
+        ))
+    }
+
+    @Test func kuanliRealOpeningFrameDetectsTheFirstPawnMove() throws {
+        let testDirectory = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+        let validationDirectory = testDirectory
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("docs/validation")
+        let beforeURL = validationDirectory.appendingPathComponent("kuanli-standard-before.png")
+        let afterURL = validationDirectory.appendingPathComponent("kuanli-red-first-move.png")
+        let before = try #require(NSImage(contentsOf: beforeURL)?.cgImage(forProposedRect: nil, context: nil, hints: nil))
+        let after = try #require(NSImage(contentsOf: afterURL)?.cgImage(forProposedRect: nil, context: nil, hints: nil))
+        let geometry = RecognitionBoardGeometry(
+            topLeft: CGPoint(x: 0.355, y: 1 - 0.084),
+            topRight: CGPoint(x: 0.814, y: 1 - 0.084),
+            bottomRight: CGPoint(x: 0.814, y: 1 - 0.952),
+            bottomLeft: CGPoint(x: 0.355, y: 1 - 0.952)
+        )
+        let differencer = BoardFrameDifferencer()
+        let first = differencer.signature(image: before, frameSequence: 1, geometry: geometry)
+        let second = differencer.signature(image: after, frameSequence: 2, geometry: geometry)
+        let change = differencer.changes(from: first, to: second, minimumScore: 0.07)
+        let decision = RecognitionTransitionPolicy.decide(
+            trusted: .standard,
+            orientation: .redAtTop,
+            visualChange: change
+        )
+        print("KUANLI_REAL_CHANGE", change.cells.map { "\($0.coordinate.file),\($0.coordinate.rank):\($0.score)" })
+        print("KUANLI_REAL_DECISION", decision)
+        #expect(decision != .unchanged)
+    }
+
+
+    @Test func kuanliMidgameFrameDoesNotGuessAssignmentWithoutOpeningEvidence() throws {
+        let testDirectory = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+        let imageURL = testDirectory
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("docs/validation/kuanli-red-at-bottom-live.png")
+        let image = try #require(NSImage(contentsOf: imageURL)?.cgImage(
+            forProposedRect: nil,
+            context: nil,
+            hints: nil
+        ))
+        let geometry = RecognitionBoardGeometry(
+            topLeft: CGPoint(x: 0.355, y: 1 - 0.084),
+            topRight: CGPoint(x: 0.814, y: 1 - 0.084),
+            bottomRight: CGPoint(x: 0.814, y: 1 - 0.952),
+            bottomLeft: CGPoint(x: 0.355, y: 1 - 0.952)
+        )
+        let assignment = KuanliBoardAssignmentDetector.detect(
+            image: image,
+            geometry: geometry
+        )
+        #expect(assignment == nil)
+    }
+
+    @Test func pieceInventoryAuditAcceptsLegalMoveAndRejectsInventedPiece() throws {
+        let move = try #require(Move(ucci: "a3a4"))
+        let after = try Position.standard.applying(move)
+        try XiangqiPieceInventoryPolicy.validateTransition(
+            before: .standard,
+            move: move,
+            after: after
+        )
+
+        var placements = after.board.placements
+        placements.append(Placement(Piece(side: .red, kind: .soldier), at: Square(file: 1, rank: 4)))
+        let invented = try Board(placements: placements)
+        #expect(throws: XiangqiPieceInventoryError.self) {
+            try XiangqiPieceInventoryPolicy.validate(invented)
+        }
+    }
+
+    @Test @MainActor func manualCorrectionReplacesNearestExcessPiece() {
+        let model = PilotPresentationModel.mock
+        let runtime = PilotRuntime(presentation: model)
+        model.pieces = [
+            BoardPiece(side: .red, character: "炮", column: 0, row: 0),
+            BoardPiece(side: .red, character: "炮", column: 8, row: 9)
+        ]
+
+        runtime.editPiece(
+            at: BoardCoordinate(column: 1, row: 0),
+            side: .red,
+            glyph: "炮"
+        )
+
+        #expect(model.pieces.count == 2)
+        #expect(!model.pieces.contains(where: { $0.coordinate == BoardCoordinate(column: 0, row: 0) }))
+        #expect(model.pieces.contains(where: { $0.coordinate == BoardCoordinate(column: 1, row: 0) }))
+        #expect(model.pieces.contains(where: { $0.coordinate == BoardCoordinate(column: 8, row: 9) }))
     }
 
     @Test func calibrationMapsEveryBoardCornerIntoTheLockedWindow() throws {
@@ -423,76 +535,6 @@ import XiangqiCore
             orientation: .redAtBottom,
             visualChange: selectedPieceOnly
         ) == .rejected)
-    }
-
-    @Test func decoratedTransitionRequiresBothEndpointsButToleratesAHighlight() throws {
-        let move = try #require(Move(ucci: "b2b9"))
-        let decorated = BoardVisualChange(
-            fromFrameSequence: 30,
-            toFrameSequence: 31,
-            cells: [
-                (BoardCellCoordinate(file: 1, rank: 7), 0.48),
-                (BoardCellCoordinate(file: 1, rank: 0), 0.57),
-                // Persistent last-move or selection decoration.
-                (BoardCellCoordinate(file: 4, rank: 4), 0.12)
-            ]
-        )
-        #expect(RecognitionTransitionPolicy.decoratedLegalMove(
-            trusted: .standard,
-            orientation: .redAtBottom,
-            visualChange: decorated
-        ) == move)
-
-        let oneEndpointOnly = BoardVisualChange(
-            fromFrameSequence: 30,
-            toFrameSequence: 31,
-            cells: [
-                (BoardCellCoordinate(file: 1, rank: 7), 0.48),
-                (BoardCellCoordinate(file: 4, rank: 4), 0.12)
-            ]
-        )
-        #expect(RecognitionTransitionPolicy.decoratedLegalMove(
-            trusted: .standard,
-            orientation: .redAtBottom,
-            visualChange: oneEndpointOnly
-        ) == nil)
-    }
-
-    @Test func stableFourEndpointDeltaCanSynchronizeTwoConsecutivePlies() throws {
-        let first = try #require(Move(ucci: "h2e2"))
-        let afterFirst = try Position.standard.applying(first)
-        let second = try #require(afterFirst.legalMoves.first)
-        let cells = [first.from, first.to, second.from, second.to].map {
-            (BoardCellCoordinate(file: $0.file, rank: $0.rank), 0.58)
-        }
-        let change = BoardVisualChange(
-            fromFrameSequence: 40,
-            toFrameSequence: 41,
-            cells: cells
-        )
-        #expect(RecognitionTransitionPolicy.decoratedLegalLine(
-            trusted: .standard,
-            orientation: .redAtBottom,
-            visualChange: change
-        ) == [first, second])
-    }
-
-    @Test func dispatchedCannonMoveCanRecognizeRealWizardHorseReply() throws {
-        let first = try #require(Move(ucci: "h2e2"))
-        let reply = try #require(Move(ucci: "b9c7"))
-        let change = BoardVisualChange(
-            fromFrameSequence: 50,
-            toFrameSequence: 51,
-            cells: [first.from, first.to, reply.from, reply.to].map {
-                (BoardCellCoordinate(file: $0.file, rank: $0.rank), 0.60)
-            }
-        )
-        #expect(RecognitionTransitionPolicy.decoratedLegalReply(
-            trusted: .standard,
-            firstMove: first,
-            orientation: .redAtBottom,
-            visualChange: change
-        ) == reply)
     }
 
     @Test func wizardNotationResolvesVisibleMoveLogAgainstLegalMoves() throws {

@@ -22,6 +22,8 @@ actor WindowCaptureService {
     private var availableSCWindows: [CGWindowID: SCWindow] = [:]
     private var availableDescriptors: [CGWindowID: CapturableWindow] = [:]
     private var stream: SCStream?
+    private var snapshotFallbackFilter: SCContentFilter?
+    private var snapshotFallbackConfiguration: SCStreamConfiguration?
     private var target: LockedCaptureTarget?
 
     private static func fallbackWindowMetadata() -> [CGWindowID: WindowMetadata] {
@@ -162,7 +164,10 @@ actor WindowCaptureService {
         // actual CGImage dimensions, so 1x external displays remain correct.
         configuration.width = min(max(Int(window.frame.width.rounded(.up)) * 2, 2), 8_192)
         configuration.height = min(max(Int(window.frame.height.rounded(.up)) * 2, 2), 8_192)
-        configuration.minimumFrameInterval = CMTime(value: 1, timescale: 30)
+        // The hot path is deliberately capped at 20fps. Two stable samples
+        // still confirm a settled move quickly, while avoiding unnecessary
+        // Retina frame copies and leaving CPU time for the chess engine.
+        configuration.minimumFrameInterval = CMTime(value: 1, timescale: 20)
         configuration.queueDepth = 3
         configuration.pixelFormat = kCVPixelFormatType_32BGRA
         configuration.showsCursor = false
@@ -178,10 +183,22 @@ actor WindowCaptureService {
             try await newStream.startCapture()
         } catch {
             output.deactivate(newStream)
-            throw error
+            // Some iOS-on-Mac games recreate their render surface while
+            // switching online rooms. The SCWindow remains valid and visible,
+            // but a persistent SCStream can transiently refuse to start. Keep
+            // the exact window binding and fall back to SCScreenshotManager;
+            // callers still receive only this window, never the full desktop.
+            output.resetForNewStream()
+            snapshotFallbackFilter = filter
+            snapshotFallbackConfiguration = configuration
+            stream = nil
+            target = lockedTarget
+            return lockedTarget
         }
 
         stream = newStream
+        snapshotFallbackFilter = nil
+        snapshotFallbackConfiguration = nil
         target = lockedTarget
         return lockedTarget
     }
@@ -209,8 +226,26 @@ actor WindowCaptureService {
     /// Returns the newest copied CGImage and an atomic set of metadata. The
     /// window geometry is queried at snapshot time so callers can detect a
     /// move/resize before preparing an action.
-    func latestFrame() throws -> CapturedFrame {
+    func latestFrame() async throws -> CapturedFrame {
         guard let target else { throw WindowCaptureError.noLockedWindow }
+        if let filter = snapshotFallbackFilter,
+           let configuration = snapshotFallbackConfiguration {
+            let image = try await SCScreenshotManager.captureImage(
+                contentFilter: filter,
+                configuration: configuration
+            )
+            let stored = output.storeFallbackImage(image)
+            return CapturedFrame(
+                image: stored.image,
+                sequence: stored.sequence,
+                presentationTime: stored.presentationTime,
+                contentFingerprint: stored.contentFingerprint,
+                consecutiveStableFrames: stored.consecutiveStableFrames,
+                imageSize: CGSize(width: stored.image.width, height: stored.image.height),
+                target: target,
+                liveWindowGeometry: Self.queryLiveWindowGeometry(windowID: target.windowID)
+            )
+        }
         // Never expose a cached image after the stream has stopped. It can no
         // longer prove a click precondition even though the pixels look valid.
         if let stopMessage = output.stopMessage {
@@ -234,22 +269,30 @@ actor WindowCaptureService {
 
     func stopCapture() async throws {
         guard let stream else {
+            snapshotFallbackFilter = nil
+            snapshotFallbackConfiguration = nil
             target = nil
             return
         }
         output.deactivate(stream)
         self.stream = nil
+        snapshotFallbackFilter = nil
+        snapshotFallbackConfiguration = nil
         target = nil
         try await stream.stopCapture()
     }
 
     private func stopCaptureIgnoringErrors() async {
         guard let stream else {
+            snapshotFallbackFilter = nil
+            snapshotFallbackConfiguration = nil
             target = nil
             return
         }
         output.deactivate(stream)
         self.stream = nil
+        snapshotFallbackFilter = nil
+        snapshotFallbackConfiguration = nil
         target = nil
         try? await stream.stopCapture()
     }
@@ -330,6 +373,29 @@ private final class StreamFrameOutput: NSObject, SCStreamOutput, SCStreamDelegat
             latestStopMessage = nil
             // Keep `sequence` monotonic across relocks so old frame tokens can
             // never accidentally become current after a stream restart.
+        }
+    }
+
+    func storeFallbackImage(_ image: CGImage) -> StoredCaptureFrame {
+        let fingerprint = Self.fingerprint(image)
+        return lock.withLock {
+            sequence &+= 1
+            if lastFingerprint == fingerprint {
+                stableFrameCount += 1
+            } else {
+                lastFingerprint = fingerprint
+                stableFrameCount = 1
+            }
+            let frame = StoredCaptureFrame(
+                image: image,
+                sequence: sequence,
+                presentationTime: ProcessInfo.processInfo.systemUptime,
+                contentFingerprint: fingerprint,
+                consecutiveStableFrames: stableFrameCount
+            )
+            latest = frame
+            latestStopMessage = nil
+            return frame
         }
     }
 
@@ -417,6 +483,34 @@ private final class StreamFrameOutput: NSObject, SCStreamOutput, SCStreamDelegat
                     hash ^= UInt64(bytes[offset + channel] & 0xf8)
                     hash &*= 1_099_511_628_211
                 }
+            }
+        }
+        return hash
+    }
+
+    private static func fingerprint(_ image: CGImage) -> UInt64 {
+        let width = 48
+        let height = 48
+        var bytes = [UInt8](repeating: 0, count: width * height * 4)
+        bytes.withUnsafeMutableBytes { buffer in
+            guard let context = CGContext(
+                data: buffer.baseAddress,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: width * 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else { return }
+            context.interpolationQuality = .low
+            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        }
+
+        var hash: UInt64 = 14_695_981_039_346_656_037
+        for pixel in stride(from: 0, to: bytes.count, by: 4) {
+            for channel in 0..<3 {
+                hash ^= UInt64(bytes[pixel + channel] & 0xf8)
+                hash &*= 1_099_511_628_211
             }
         }
         return hash

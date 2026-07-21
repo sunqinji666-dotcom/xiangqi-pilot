@@ -37,6 +37,12 @@ enum BoardOrientation: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
+enum BackgroundVisualReconciliationPolicy {
+    static func allows(bundleIdentifier: String?) -> Bool {
+        bundleIdentifier == "com.cronlygames.chschess.mac"
+    }
+}
+
 enum PositionVerificationPolicy {
     /// A captured board has no reliable turn indicator. The expected position
     /// comes from the already-validated legal move, so visual verification must
@@ -136,6 +142,39 @@ enum PositionVerificationPolicy {
 }
 
 enum StandardPositionRecognitionPolicy {
+    /// Occupancy-only check for standard opening bootstrap (before glyph
+    /// classification). Returns true when exactly the 32 standard squares
+    /// are occupied, regardless of piece colour or kind.
+    static func matches(
+        occupiedCells: Set<BoardCellCoordinate>,
+        orientation: BoardOrientation
+    ) -> Bool {
+        occupiedCells == expectedCoordinates(orientation: orientation)
+    }
+
+    private static func expectedCoordinates(
+        orientation: BoardOrientation
+    ) -> Set<BoardCellCoordinate> {
+        var expected: Set<BoardCellCoordinate> = []
+        for placement in Position.standard.board.placements {
+            let coordinate: BoardCellCoordinate
+            switch orientation {
+            case .redAtBottom:
+                coordinate = BoardCellCoordinate(
+                    file: placement.square.file,
+                    rank: placement.square.rank
+                )
+            case .redAtTop:
+                coordinate = BoardCellCoordinate(
+                    file: 8 - placement.square.file,
+                    rank: 9 - placement.square.rank
+                )
+            }
+            expected.insert(coordinate)
+        }
+        return expected
+    }
+
     /// OCR on stylized skins often gets piece colours wrong while preserving
     /// intersection and piece kind. Recover the canonical opening only when a
     /// high-coverage set of unique detections agrees with every standard
@@ -286,6 +325,10 @@ final class PilotRuntime: ObservableObject {
     )
     private let sessionMachine = SessionStateMachine()
     private let sessionStore = SessionStore()
+    /// A local Unix-domain socket, not a TCP port.  It lets an optional AI
+    /// operator receive compact board/candidate events without exposing a
+    /// service on the LAN or adding HTTP polling latency.
+    private let collaborationBridge = AICollaborationBridge()
     private var capturePollingTask: Task<Void, Never>?
     private var analysisTask: Task<Void, Never>?
     private var calibration: BoardCalibration?
@@ -381,16 +424,21 @@ final class PilotRuntime: ObservableObject {
         presentation.gridDeviationPixels = nil
         presentation.lastModelBilling = nil
         presentation.modelSessionCostCNY = 0
+        presentation.collaborationStatus = "本机协同未启动"
+        presentation.collaborationLatencyMilliseconds = nil
         wirePresentationActions()
+        wireCollaborationBridge()
     }
 
     deinit {
         capturePollingTask?.cancel()
         analysisTask?.cancel()
         recoveryTask?.cancel()
+        collaborationBridge.stop()
     }
 
     func bootstrap() async {
+        startCollaborationBridge()
         refreshPermissionState()
         await configureIntelligence()
         // Keep the first actual move responsive.  The client is idempotent and
@@ -409,6 +457,257 @@ final class PilotRuntime: ObservableObject {
         }
     }
 
+    private func wireCollaborationBridge() {
+        collaborationBridge.onStateChange = { [weak self] snapshot in
+            Task { @MainActor in self?.applyCollaborationSnapshot(snapshot) }
+        }
+        collaborationBridge.onEnvelope = { [weak self] envelope in
+            Task { @MainActor in await self?.handleCollaborationEnvelope(envelope) }
+        }
+    }
+
+    private func startCollaborationBridge() {
+        do {
+            try collaborationBridge.start()
+            applyCollaborationSnapshot(collaborationBridge.snapshot())
+        } catch {
+            presentation.collaborationStatus = "桥接启动失败"
+            presentation.recordEvent(
+                title: "本机协同未启动",
+                detail: error.localizedDescription,
+                symbolName: "bolt.slash.fill",
+                tone: .attention
+            )
+        }
+    }
+
+    private func applyCollaborationSnapshot(_ snapshot: AIBridgeSnapshot) {
+        presentation.collaborationLatencyMilliseconds = snapshot.lastRoundTripMilliseconds
+        presentation.collaborationStatus = switch snapshot.state {
+        case .stopped: "未启动"
+        case .listening: "等待AI连接"
+        case .connected: "AI已连接（\(snapshot.connectedClients)）"
+        case .failed: "桥接异常"
+        }
+    }
+
+    private func handleCollaborationEnvelope(_ envelope: AIBridgeEnvelope) async {
+        switch envelope.type {
+        case .hello, .heartbeat:
+            acknowledgeBridgeMessage(envelope, status: "ok")
+        case .requestSnapshot:
+            publishBridgeBoardState(correlationID: envelope.id)
+            // A bridge client can reconnect after the engine has already
+            // published its preview. Replaying the still-bound candidate is
+            // safe (it carries the same FEN and frame sequence) and prevents
+            // an external click operator from waiting indefinitely for an
+            // event that was emitted before it connected.
+            if presentation.phase == .previewing {
+                publishBridgeCandidates()
+            }
+        case .aiRecognizedPosition:
+            await handleAIRecognizedPosition(envelope)
+        case .requestExecution:
+            await handleBridgeExecutionRequest(envelope)
+        case .pause:
+            presentation.isPaused = true
+            await clickExecutor.pause(.userRequested)
+            acknowledgeBridgeMessage(envelope, status: "paused")
+        case .resume:
+            // A remote process must never silently re-enable input. The user
+            // resumes from the cockpit, which re-arms and revalidates the
+            // locked window immediately before a click.
+            acknowledgeBridgeMessage(envelope, status: "rejected", detail: "恢复控制必须在驾驶舱内确认")
+        case .acknowledgement, .boardState, .candidateReady, .actionRequested,
+             .actionReceipt, .error:
+            break
+        }
+    }
+
+    /// AI collaboration deliberately has no ScreenCaptureKit or click
+    /// dependency: the operator owns the screen while this process validates
+    /// FEN and supplies engine decisions.
+    private func handleAIRecognizedPosition(_ envelope: AIBridgeEnvelope) async {
+        guard presentation.selectedGame == .xiangqi,
+              let fen = envelope.payload.fen else {
+            acknowledgeBridgeMessage(envelope, status: "rejected", detail: "AI读盘未提供FEN")
+            return
+        }
+
+        do {
+            let position = try Position(fen: fen)
+            guard position.board.generalSquare(for: .red) != nil,
+                  position.board.generalSquare(for: .black) != nil else {
+                throw XiangqiError.invalidFEN("AI读盘缺少红帅或黑将")
+            }
+
+            analysisTask?.cancel()
+            game.reset(to: position)
+            sideToMove = position.sideToMove
+            positionIsTrusted = true
+            recognizedPieceCount = position.board.pieceCount()
+            trustedBoardSignature = nil
+            lastTrustedPosition = position
+            lastReconciledFrameSequence = 0
+            selectedWindowID = nil
+            selectedBundleIdentifier = nil
+            setupStep = .ready
+            presentation.source = WindowSource(
+                id: "ai-collaboration",
+                applicationName: "孙小吉 AI协同",
+                windowTitle: "AI负责读盘与点击",
+                isLocked: false
+            )
+            presentation.confidence = min(1, max(0, envelope.payload.confidence ?? 1))
+            presentation.confidenceBasis = "AI读盘＋本地棋规"
+            presentation.isPaused = false
+            presentation.isEmergencyStopped = false
+            presentation.phase = .thinking
+            recognitionWarnings = []
+            blockingError = nil
+            synchronizePresentation(position: position)
+            statusMessage = "AI已读盘并通过本地棋规校验；正在交给引擎决策"
+            presentation.recordEvent(
+                title: "AI读盘局面已接收",
+                detail: "\(recognizedPieceCount)枚 · 无窗口绑定 · AI负责点击",
+                symbolName: "eye.trianglebadge.exclamationmark",
+                tone: .success
+            )
+            acknowledgeBridgeMessage(envelope, status: "accepted", detail: "FEN已校验；驾驶舱仅负责规则与引擎")
+            await analyzeCurrentPosition()
+        } catch {
+            acknowledgeBridgeMessage(envelope, status: "rejected", detail: "AI读盘FEN无效：\(error.localizedDescription)")
+        }
+    }
+
+    private func handleBridgeExecutionRequest(_ envelope: AIBridgeEnvelope) async {
+        guard selectedWindowID != nil else {
+            acknowledgeBridgeMessage(envelope, status: "rejected", detail: "AI协同模式由AI直接点击；驾驶舱不执行窗口操作")
+            return
+        }
+        let requestedMove = envelope.payload.moveUCCI
+        let frameSequence = envelope.payload.frameSequence
+        let isCurrentFrame = frameSequence == latestCapturedFrame?.sequence
+        let candidate = presentation.selectedCandidate
+        guard presentation.selectedGame == .xiangqi,
+              presentation.controlMode == .automatic,
+              positionIsTrusted,
+              !presentation.isPaused,
+              !presentation.isEmergencyStopped,
+              presentation.phase == .previewing,
+              requestedMove == candidate.id,
+              envelope.payload.fen == game.position.fen,
+              isCurrentFrame,
+              Move(ucci: candidate.id) != nil else {
+            acknowledgeBridgeMessage(envelope, status: "rejected", detail: "请求未绑定当前可信局面、帧或自动候选")
+            return
+        }
+
+        acknowledgeBridgeMessage(envelope, status: "accepted", detail: "驾驶舱将执行已验证候选")
+        presentation.recordEvent(
+            title: "本机协同请求已接受",
+            detail: "\(candidate.notation) · 已重验局面与帧绑定",
+            symbolName: "bolt.horizontal.circle.fill",
+            tone: .attention
+        )
+        await execute(candidate)
+    }
+
+    private func acknowledgeBridgeMessage(
+        _ envelope: AIBridgeEnvelope,
+        status: String,
+        detail: String? = nil
+    ) {
+        _ = collaborationBridge.broadcast(AIBridgeEnvelope(
+            type: .acknowledgement,
+            payload: AIBridgePayload(
+                correlationID: envelope.id,
+                status: status,
+                detail: detail
+            )
+        ))
+    }
+
+    private func publishBridgeBoardState(correlationID: String? = nil) {
+        // The AI needs the current frame binding before it can safely submit
+        // a first read.  Do not leak a speculative FEN here: an untrusted
+        // boardState carries only window/frame metadata and status.
+        guard presentation.selectedGame == .xiangqi else { return }
+        let frame = latestCapturedFrame
+        _ = collaborationBridge.broadcast(AIBridgeEnvelope(
+            type: .boardState,
+            payload: AIBridgePayload(
+                correlationID: correlationID,
+                windowID: selectedWindowID,
+                ownerPID: frame?.target.ownerPID,
+                applicationName: frame?.target.applicationName,
+                windowTitle: frame?.target.title,
+                phase: presentation.phase.title,
+                status: statusMessage,
+                fen: positionIsTrusted ? game.position.fen : nil,
+                sideToMove: positionIsTrusted
+                    ? (game.position.sideToMove == .red ? "red" : "black")
+                    : nil,
+                confidence: positionIsTrusted ? presentation.confidence : nil,
+                frameSequence: frame?.sequence
+            )
+        ))
+    }
+
+    private func publishBridgeCandidates() {
+        guard presentation.selectedGame == .xiangqi,
+              positionIsTrusted else { return }
+        let candidates = presentation.candidates.compactMap { candidate -> AIBridgeCandidate? in
+            guard candidate.id != CandidateMove.unavailable.id else { return nil }
+            return AIBridgeCandidate(
+                ucci: candidate.id,
+                score: candidate.score,
+                evaluation: candidate.evaluation
+            )
+        }
+        guard !candidates.isEmpty else { return }
+        let frame = latestCapturedFrame
+        // Coordinates are available only in standalone automation mode. The
+        // AI collaboration client receives UCCI and observes/clicks its own
+        // current screen, so it never inherits stale app-window coordinates.
+        let selected = presentation.selectedCandidate
+        let clickPoints: (origin: CGPoint, target: CGPoint)? = if let calibration,
+            let frame,
+            let window = frame.liveWindowGeometry,
+            let origin = try? calibration.globalScreenPoint(
+                for: XiangqiGridPoint(file: selected.origin.column, rank: selected.origin.row),
+                in: window.frame
+            ),
+            let target = try? calibration.globalScreenPoint(
+                for: XiangqiGridPoint(file: selected.target.column, rank: selected.target.row),
+                in: window.frame
+            ) {
+            (origin, target)
+        } else {
+            nil
+        }
+        _ = collaborationBridge.broadcast(AIBridgeEnvelope(
+            type: .candidateReady,
+            payload: AIBridgePayload(
+                windowID: selectedWindowID,
+                ownerPID: frame?.target.ownerPID,
+                applicationName: frame?.target.applicationName,
+                windowTitle: frame?.target.title,
+                phase: presentation.phase.title,
+                status: statusMessage,
+                fen: game.position.fen,
+                sideToMove: game.position.sideToMove == .red ? "red" : "black",
+                confidence: presentation.confidence,
+                frameSequence: frame?.sequence,
+                candidates: candidates,
+                sourceX: clickPoints.map { Double($0.origin.x) },
+                sourceY: clickPoints.map { Double($0.origin.y) },
+                destinationX: clickPoints.map { Double($0.target.x) },
+                destinationY: clickPoints.map { Double($0.target.y) }
+            )
+        ))
+    }
+
     func refreshPermissionState() {
         let snapshot = MacPermissionsService.currentSnapshot()
         hasScreenRecordingPermission = snapshot.screenRecording == .granted
@@ -423,6 +722,43 @@ final class PilotRuntime: ObservableObject {
         } else if !permissionIdentityIsStable {
             statusMessage = "当前应用签名身份不稳定，重新构建后可能需要再次授权"
         }
+    }
+
+    func startAICollaboration() {
+        guard presentation.selectedGame == .xiangqi else {
+            blockingError = "AI协同决策当前只支持中国象棋"
+            return
+        }
+        setupStep = .ready
+        selectedWindowID = nil
+        selectedBundleIdentifier = nil
+        calibration = nil
+        latestCapturedFrame = nil
+        latestImage = nil
+        trustedBoardSignature = nil
+        positionIsTrusted = false
+        presentation.isPaused = true
+        presentation.isEmergencyStopped = false
+        presentation.phase = .observing
+        presentation.source = WindowSource(
+            id: "ai-collaboration",
+            applicationName: "孙小吉 AI协同",
+            windowTitle: "等待AI提交局面",
+            isLocked: false
+        )
+        presentation.confidence = 0
+        presentation.confidenceBasis = "等待AI读盘"
+        presentation.pieces = []
+        presentation.candidates = [.unavailable]
+        presentation.selectedCandidateID = CandidateMove.unavailable.id
+        blockingError = nil
+        statusMessage = "AI协同已就绪：无需选择窗口，等待AI提交FEN"
+        presentation.recordEvent(
+            title: "AI协同决策已启动",
+            detail: "驾驶舱不读屏、不绑定窗口、不点击；仅校验局面与分析走法",
+            symbolName: "bolt.horizontal.circle.fill",
+            tone: .success
+        )
     }
 
     func requestScreenRecordingPermission() {
@@ -530,6 +866,51 @@ final class PilotRuntime: ObservableObject {
         )
         setupStep = .window
         statusMessage = "请选择正在运行的\(gameKind.title)窗口"
+        await refreshWindows()
+    }
+
+    func returnToHome() async {
+        analysisTask?.cancel()
+        recoveryTask?.cancel()
+        capturePollingTask?.cancel()
+        capturePollingTask = nil
+        await clickExecutor.pause(.manualTakeover)
+        await gridState.clickExecutor.pause()
+        try? await capture.stopCapture()
+
+        calibration = nil
+        gridState.reset()
+        latestCapturedFrame = nil
+        latestImage = nil
+        trustedBoardSignature = nil
+        lastTrustedPosition = nil
+        selectedWindowID = nil
+        selectedBundleIdentifier = nil
+        selectedCalibrationKey = nil
+        positionIsTrusted = false
+        recognizedPieceCount = 0
+        game.reset(to: .standard)
+        presentation.pieces = []
+        presentation.gridStones = []
+        presentation.gridLineCount = presentation.selectedGame.gridLineCount
+        presentation.candidates = [.unavailable]
+        presentation.selectedCandidateID = CandidateMove.unavailable.id
+        presentation.liveImage = nil
+        presentation.confidence = 0
+        presentation.confidenceBasis = "尚未识别"
+        presentation.isPaused = true
+        presentation.isEmergencyStopped = false
+        presentation.safetyNotice = nil
+        presentation.phase = .observing
+        presentation.source = WindowSource(
+            id: "unselected",
+            applicationName: "尚未选择窗口",
+            windowTitle: "完成首次设置后开始",
+            isLocked: false
+        )
+        setupStep = .window
+        blockingError = nil
+        statusMessage = "已返回首页，请选择新的棋盘窗口"
         await refreshWindows()
     }
 
@@ -742,14 +1123,17 @@ final class PilotRuntime: ObservableObject {
         defer { isBusy = false }
 
         do {
-            if XiangqiWebMoveLogReader.matches(
+            let isWebMoveLogTarget = XiangqiWebMoveLogReader.matches(
                 bundleIdentifier: selectedBundleIdentifier,
                 windowTitle: frame.target.title
-            ) {
-                guard let replay = XiangqiWebMoveLogReader.replayedPosition(
-                    ownerPID: frame.target.ownerPID
-                ) else {
-                    throw XiangqiError.invalidFEN("网页走棋记录无法解析")
+            )
+            let isWizardMoveLogTarget = selectedBundleIdentifier == XiangqiWizardMoveLogReader.bundleIdentifier
+            if isWebMoveLogTarget || isWizardMoveLogTarget {
+                let replay = isWizardMoveLogTarget
+                    ? XiangqiWizardMoveLogReader.replayedPosition(ownerPID: frame.target.ownerPID)
+                    : XiangqiWebMoveLogReader.replayedPosition(ownerPID: frame.target.ownerPID)
+                guard let replay else {
+                    throw XiangqiError.invalidFEN(isWizardMoveLogTarget ? "象棋巫师走棋记录无法解析" : "网页走棋记录无法解析")
                 }
                 game.reset(to: .standard)
                 for move in replay.moves {
@@ -903,19 +1287,28 @@ final class PilotRuntime: ObservableObject {
                 }
             } else {
                 game.reset(to: position)
-                positionIsTrusted = !snapshot.requiresHumanReview
+                let mayTrustArbitraryBaseline = ArbitraryPositionTrustPolicy.mayEstablishBaseline(
+                    backend: recognizer.backend,
+                    snapshot: snapshot
+                )
+                positionIsTrusted = mayTrustArbitraryBaseline
                 presentation.confidence = snapshot.confidence
-                presentation.confidenceBasis = "本地视觉"
+                presentation.confidenceBasis = mayTrustArbitraryBaseline
+                    ? recognizer.backend.displayName
+                    : "本地视觉草稿（需人工确认）"
                 synchronizePresentation(position: position)
                 if positionIsTrusted { trustedBoardSignature = signature }
-                statusMessage = snapshot.requiresHumanReview
-                    ? "识别完成，请在数字棋盘上确认或纠正"
-                    : "局面已通过本地视觉识别"
+                if !mayTrustArbitraryBaseline, !snapshot.requiresHumanReview {
+                    recognitionWarnings.append("当前识别器未安装经验证的14类本地模型；任意中残局仅作为校正草稿")
+                }
+                statusMessage = mayTrustArbitraryBaseline
+                    ? "局面已通过本地14类模型识别"
+                    : "识别完成，请在数字棋盘上确认或纠正"
                 presentation.recordEvent(
-                    title: snapshot.requiresHumanReview ? "局面等待人工确认" : "局面识别可信",
-                    detail: "\(position.board.pieceCount())枚棋子 · \(sideToMove == .red ? "红方" : "黑方")走 · 本地视觉",
-                    symbolName: snapshot.requiresHumanReview ? "exclamationmark.triangle.fill" : "checkmark.seal.fill",
-                    tone: snapshot.requiresHumanReview ? .attention : .success
+                    title: mayTrustArbitraryBaseline ? "局面识别可信" : "局面等待人工确认",
+                    detail: "\(position.board.pieceCount())枚棋子 · \(sideToMove == .red ? "红方" : "黑方")走 · \(presentation.confidenceBasis)",
+                    symbolName: mayTrustArbitraryBaseline ? "checkmark.seal.fill" : "exclamationmark.triangle.fill",
+                    tone: mayTrustArbitraryBaseline ? .success : .attention
                 )
             }
             await analyzeCurrentPosition()
@@ -1118,12 +1511,36 @@ final class PilotRuntime: ObservableObject {
     func editPiece(at coordinate: BoardCoordinate, side: XiangqiSide?, glyph: String?) {
         presentation.pieces.removeAll { $0.coordinate == coordinate }
         if let side, let glyph {
+            // A correction is a replacement operation, not permission to invent
+            // material.  When the selected side already has the maximum number
+            // of this piece kind, replace the closest existing instance.  This
+            // makes common OCR corrections (for example moving a misread cannon
+            // one intersection over) preserve a physically possible inventory.
+            if let kind = pieceKind(for: glyph) {
+                let matchingPieces = presentation.pieces.filter {
+                    $0.side == side && pieceKind(for: $0.character) == kind
+                }
+                let maximum = XiangqiPieceInventoryPolicy.maximum(for: kind)
+                if matchingPieces.count >= maximum,
+                   let nearest = matchingPieces.min(by: {
+                       squaredDistance(from: $0.coordinate, to: coordinate)
+                       < squaredDistance(from: $1.coordinate, to: coordinate)
+                   }) {
+                    presentation.pieces.removeAll { $0.id == nearest.id }
+                }
+            }
             presentation.pieces.append(
                 BoardPiece(side: side, character: glyph, column: coordinate.column, row: coordinate.row)
             )
         }
         recognizedPieceCount = presentation.pieces.count
         positionIsTrusted = false
+    }
+
+    private func squaredDistance(from lhs: BoardCoordinate, to rhs: BoardCoordinate) -> Int {
+        let columnDelta = lhs.column - rhs.column
+        let rowDelta = lhs.row - rhs.row
+        return columnDelta * columnDelta + rowDelta * rowDelta
     }
 
     func commitManualPosition() async {
@@ -1137,6 +1554,7 @@ final class PilotRuntime: ObservableObject {
                 return Placement(Piece(side: side, kind: kind), at: square)
             }
             let board = try Board(placements: placements)
+            try XiangqiPieceInventoryPolicy.validate(board)
             guard board.generalSquare(for: .red) != nil,
                   board.generalSquare(for: .black) != nil else {
                 throw XiangqiError.invalidFEN("任意局面必须同时包含红帅和黑将")
@@ -1713,18 +2131,37 @@ final class PilotRuntime: ObservableObject {
         }
         let origin = visualCoordinate(for: move.from)
         let target = visualCoordinate(for: move.to)
+        let centipawns = result.scoreCentipawns ?? 0
+        let evaluation: String
+        let score: Int
+        if let mateInMoves = result.mateInMoves {
+            evaluation = mateInMoves > 0 ? "绝杀 \(mateInMoves)" : "被杀 \(-mateInMoves)"
+            score = mateInMoves > 0 ? 99 : 1
+        } else {
+            evaluation = evaluationText(centipawns)
+            score = confidencePercent(for: centipawns)
+        }
+        let telemetry = [
+            result.depth.map { depth in
+                result.selectiveDepth.map { "深度 \(depth)/\($0)" } ?? "深度 \(depth)"
+            },
+            result.nodesPerSecond.map { "\($0) NPS" },
+            result.engineTimeMilliseconds.map { "\($0)ms" }
+        ].compactMap { $0 }.joined(separator: " · ")
+        let variation = result.principalVariation.dropFirst().prefix(5).joined(separator: " ").nilIfEmpty
         presentation.candidates = [CandidateMove(
             id: move.ucci,
             notation: displayNotation(for: move),
             origin: origin,
             target: target,
-            score: confidencePercent(for: result.scoreCentipawns ?? 0),
-            evaluation: evaluationText(result.scoreCentipawns ?? 0),
-            reason: result.principalVariation.dropFirst().prefix(5).joined(separator: " ").nilIfEmpty
-                ?? "Pikafish 深度 \(result.depth ?? 0)"
+            score: score,
+            evaluation: evaluation,
+            reason: [variation, telemetry].compactMap { $0 }.joined(separator: " · ").nilIfEmpty
+                ?? "Pikafish 分析完成"
         )]
         presentation.selectedCandidateID = move.ucci
         presentation.phase = .previewing
+        publishBridgeCandidates()
         scheduleAutomaticExecutionIfEligible()
     }
 
@@ -2369,6 +2806,7 @@ final class PilotRuntime: ObservableObject {
         presentation.candidates = candidates.isEmpty ? [.unavailable] : candidates
         presentation.selectedCandidateID = presentation.candidates[0].id
         presentation.phase = candidates.isEmpty ? .observing : .previewing
+        publishBridgeCandidates()
         scheduleAutomaticExecutionIfEligible()
     }
 
@@ -2851,6 +3289,7 @@ final class PilotRuntime: ObservableObject {
             )
         }
         presentation.phase = .thinking
+        publishBridgeBoardState()
     }
 
     private func makePosition(from snapshot: XiangqiRecognitionSnapshot) throws -> Position {
@@ -3341,13 +3780,17 @@ final class PilotRuntime: ObservableObject {
         // looks like a catastrophic board mutation. A real GUI move can only
         // be made while the locked target is frontmost, so inactive frames are
         // display-only and must never advance or invalidate the digital board.
-        // A browser's official ICCS score is accessible even while the
-        // cockpit is frontmost.  Continuing to poll that deterministic record
-        // is both safer and more useful than demanding that the user leave the
-        // browser on top; no visual/OCR inference is accepted for this route.
+        // 象棋巫师 and browser adapters expose a deterministic move record even
+        // while the cockpit is frontmost. Continuing to poll that record is
+        // both safer and more useful than demanding that the user leave the
+        // board window visible; no visual/OCR inference is accepted for this
+        // route. This is crucial for the cockpit-only workflow: the live
+        // preview may keep changing in the background, but the digital board
+        // must still advance immediately from the verified move log.
         // Pure visual targets still require foreground ownership so inactive
         // rendering cannot be mistaken for a board mutation.
-        guard isWebMoveLogTarget
+        guard isWizardTarget
+                || isWebMoveLogTarget
                 || NSWorkspace.shared.frontmostApplication?.processIdentifier == frame.target.ownerPID else {
             pendingObservedMove = nil
             rejectedChangeKey = nil
@@ -3733,6 +4176,10 @@ final class PilotRuntime: ObservableObject {
         presentation.onGameChanged = { [weak self] gameKind in
             guard let self else { return }
             Task { @MainActor in await self.changeGameKind(gameKind) }
+        }
+        presentation.onReturnHome = { [weak self] in
+            guard let self else { return }
+            Task { @MainActor in await self.returnToHome() }
         }
     }
 

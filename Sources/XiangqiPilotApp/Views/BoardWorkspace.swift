@@ -133,7 +133,7 @@ struct BoardWorkspace: View {
 
             HStack(spacing: 4) {
                 StatusDot(color: CockpitPalette.green)
-                Text("窗口已锁定")
+                Text(model.source.isLocked ? "窗口已锁定" : "AI协同 · 不读屏")
                     .font(.system(size: 9, weight: .semibold))
                     .foregroundStyle(CockpitPalette.green)
             }

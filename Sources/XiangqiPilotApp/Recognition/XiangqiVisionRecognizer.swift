@@ -52,7 +52,13 @@ struct XiangqiRecognitionSnapshot: Codable, Sendable {
     }
 
     var requiresHumanReview: Bool {
-        confidence < 0.985 || warnings.contains { $0.contains("帅") || $0.contains("将") }
+        // A high mean OCR confidence is not evidence that every occupied
+        // intersection was classified correctly.  In particular, a stylised
+        // 黑卒 can be read very confidently as 炮.  Never promote a partial,
+        // side-unknown, or occupancy-conflicting scan to a trusted position.
+        confidence < 0.985 || !hasCompleteClassification ||
+        localOccupancy != Set(pieces.map { BoardCellCoordinate(file: $0.file, rank: $0.rank) }) ||
+        !warnings.isEmpty
     }
 
     var hasCompleteClassification: Bool {
@@ -278,7 +284,8 @@ struct RecognitionBoardGeometry: Sendable {
     }
 }
 
-final class XiangqiVisionRecognizer: @unchecked Sendable {
+final class XiangqiVisionRecognizer: XiangqiPieceRecognizer, @unchecked Sendable {
+    let backend: XiangqiPieceRecognizerBackend = .legacyVisionFallback
     private let visionQueue = DispatchQueue(label: "xiangqi.vision.recognition", qos: .userInitiated)
     private let ciContext = CIContext(options: [.cacheIntermediates: true])
     private let glyphMap: [Character: (RecognizedPieceKind, RecognizedSide)] = [
@@ -290,11 +297,10 @@ final class XiangqiVisionRecognizer: @unchecked Sendable {
         "馬": (.horse, .unknown), "马": (.horse, .unknown), "傌": (.horse, .red),
         "車": (.chariot, .unknown), "车": (.chariot, .unknown), "俥": (.chariot, .red),
         "炮": (.cannon, .unknown), "砲": (.cannon, .unknown),
-        // Common single-glyph Vision confusions on stylized board skins. The
-        // side stays unknown and is resolved from the piece colour.
-        "生": (.advisor, .unknown),
-        "抱": (.cannon, .unknown), "饱": (.cannon, .unknown),
-        "乒": (.soldier, .unknown), "岳": (.soldier, .unknown)
+        // Do not map look-alike OCR output (for example 抱→炮 or 岳→兵)
+        // directly to a chessman.  A false positive is worse than an unknown
+        // square: unknown enters the correction flow, while a guessed kind
+        // can poison an otherwise legal-looking position.
     ]
     private let canonicalWords = [
         "帅", "帥", "將", "将", "仕", "士", "相", "象", "兵", "卒",
@@ -421,17 +427,11 @@ final class XiangqiVisionRecognizer: @unchecked Sendable {
                 }
             }
         }
-        for piece in inferRepeatedPieceTemplates(
-            image: image,
-            geometry: geometry,
-            recognized: Array(byCell.values),
-            detectedOccupancy: detectedOccupancy
-        ) {
-            let key = piece.rank * 9 + piece.file
-            if byCell[key] == nil {
-                byCell[key] = piece
-            }
-        }
+        // Repeated-template completion deliberately does not mutate the
+        // automatic result.  A highlighted empty intersection can satisfy
+        // occupancy detection and then be "completed" as a pawn/cannon from
+        // an unrelated template.  Missing pieces stay visible as an
+        // occupancy/classification mismatch and require correction.
 
         let pieces = byCell.values.sorted { ($0.rank, $0.file) < ($1.rank, $1.file) }
         let recognizedOccupancy = Set(pieces.map {

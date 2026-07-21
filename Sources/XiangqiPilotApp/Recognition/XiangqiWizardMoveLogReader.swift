@@ -24,6 +24,36 @@ enum XiangqiWizardTerminalResult: Equatable, Sendable {
 enum XiangqiWizardMoveLogReader {
     static let bundleIdentifier = "com.jpcxc.xqwiphone"
 
+    /// Replays every currently exposed official notation from the standard
+    /// position. This is the cold-start path for connecting to a game already
+    /// in progress; assuming a fresh opening here makes otherwise-correct
+    /// clicks target squares that are now empty.
+    static func replayedPosition(ownerPID: pid_t) -> (position: Position, moves: [Move])? {
+        var notations: [String] = []
+        for plyIndex in 0..<512 {
+            guard let notation = recordedNotation(ownerPID: ownerPID, plyIndex: plyIndex) else {
+                break
+            }
+            notations.append(notation)
+        }
+        return replayedPosition(notations: notations)
+    }
+
+    static func replayedPosition(notations: [String]) -> (position: Position, moves: [Move])? {
+        guard !notations.isEmpty else { return nil }
+        var position = Position.standard
+        var moves: [Move] = []
+        for notation in notations {
+            guard let move = uniqueLegalMove(matching: notation, in: position),
+                  let next = try? position.applying(move) else {
+                return nil
+            }
+            moves.append(move)
+            position = next
+        }
+        return (position, moves)
+    }
+
     static func latestLegalMove(
         ownerPID: pid_t,
         expectedPlyIndex: Int,
@@ -199,7 +229,11 @@ enum XiangqiWizardMoveLogReader {
         for description in descriptions.reversed() {
             let parts = description.split(separator: ",", omittingEmptySubsequences: false)
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            guard parts.count >= 3 else { continue }
+            // Before the computer replies, 象棋巫师 exposes a row as just
+            // "1., 炮八平五".  Requiring a third (black) column made the
+            // reader ignore every freshly played red move and left the
+            // cockpit on the previous FEN.
+            guard parts.indices.contains(tokenIndex) else { continue }
             let roundToken = parts[0].replacingOccurrences(of: ".", with: "")
             guard Int(normalize(roundToken)) == expectedRound,
                   parts.indices.contains(tokenIndex),

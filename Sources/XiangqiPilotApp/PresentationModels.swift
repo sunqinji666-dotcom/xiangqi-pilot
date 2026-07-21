@@ -288,6 +288,11 @@ final class PilotPresentationModel: ObservableObject {
     @Published var gridDeviationPixels: Double?
     @Published var lastModelBilling: ModelCallBilling?
     @Published var modelSessionCostCNY: Double
+    /// Status for the local-only collaboration bridge. It is deliberately
+    /// separate from cloud-model state: this reports the fast local hand-off
+    /// between the cockpit and an optional AI operator.
+    @Published var collaborationStatus: String
+    @Published var collaborationLatencyMilliseconds: Double?
     @Published var isPaused: Bool
     @Published var isEmergencyStopped: Bool
     /// The exact reason for a safe pause belongs in the cockpit, not only in
@@ -347,6 +352,7 @@ final class PilotPresentationModel: ObservableObject {
     var onEngineSourceChanged: ((EngineSource) -> Void)?
     var onEditPiece: ((BoardCoordinate, XiangqiSide?, String?) -> Void)?
     var onGameChanged: ((GameKind) -> Void)?
+    var onReturnHome: (() -> Void)?
 
     var selectedCandidate: CandidateMove {
         candidates.first(where: { $0.id == selectedCandidateID }) ?? candidates.first ?? .unavailable
@@ -404,6 +410,8 @@ final class PilotPresentationModel: ObservableObject {
         gridDeviationPixels: Double? = nil,
         lastModelBilling: ModelCallBilling? = nil,
         modelSessionCostCNY: Double = 0,
+        collaborationStatus: String = "本机协同未启动",
+        collaborationLatencyMilliseconds: Double? = nil,
         isPaused: Bool = false,
         isEmergencyStopped: Bool = false,
         safetyNotice: String? = nil,
@@ -432,6 +440,8 @@ final class PilotPresentationModel: ObservableObject {
         self.gridDeviationPixels = gridDeviationPixels
         self.lastModelBilling = lastModelBilling
         self.modelSessionCostCNY = modelSessionCostCNY
+        self.collaborationStatus = collaborationStatus
+        self.collaborationLatencyMilliseconds = collaborationLatencyMilliseconds
         self.isPaused = isPaused
         self.isEmergencyStopped = isEmergencyStopped
         self.safetyNotice = safetyNotice
@@ -480,6 +490,10 @@ final class PilotPresentationModel: ObservableObject {
             tone: .danger
         )
         onEmergencyStop?()
+    }
+
+    func returnHome() {
+        onReturnHome?()
     }
 
     func resumeAfterStop() {

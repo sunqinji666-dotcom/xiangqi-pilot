@@ -27,6 +27,39 @@ struct UCCIAnalysis: Sendable, Hashable {
     let depth: Int?
     let scoreCentipawns: Int?
     let principalVariation: [String]
+    /// Selective depth is useful when comparing two analyses that reached the
+    /// same nominal depth through very different tactical trees.
+    let selectiveDepth: Int?
+    /// Positive values mean the engine reports a forced mate for the side to
+    /// move; negative values mean the side to move is being mated.
+    let mateInMoves: Int?
+    let nodes: Int?
+    let nodesPerSecond: Int?
+    let engineTimeMilliseconds: Int?
+
+    init(
+        bestMove: String,
+        ponderMove: String?,
+        depth: Int?,
+        scoreCentipawns: Int?,
+        principalVariation: [String],
+        selectiveDepth: Int? = nil,
+        mateInMoves: Int? = nil,
+        nodes: Int? = nil,
+        nodesPerSecond: Int? = nil,
+        engineTimeMilliseconds: Int? = nil
+    ) {
+        self.bestMove = bestMove
+        self.ponderMove = ponderMove
+        self.depth = depth
+        self.scoreCentipawns = scoreCentipawns
+        self.principalVariation = principalVariation
+        self.selectiveDepth = selectiveDepth
+        self.mateInMoves = mateInMoves
+        self.nodes = nodes
+        self.nodesPerSecond = nodesPerSecond
+        self.engineTimeMilliseconds = engineTimeMilliseconds
+    }
 }
 
 enum UCCIEngineError: LocalizedError {
@@ -189,8 +222,13 @@ actor UCCIEngineClient {
             bestMove: tokens[1],
             ponderMove: ponder,
             depth: lastInfo.depth,
-            scoreCentipawns: lastInfo.score,
-            principalVariation: lastInfo.pv
+            scoreCentipawns: lastInfo.scoreCentipawns,
+            principalVariation: lastInfo.principalVariation,
+            selectiveDepth: lastInfo.selectiveDepth,
+            mateInMoves: lastInfo.mateInMoves,
+            nodes: lastInfo.nodes,
+            nodesPerSecond: lastInfo.nodesPerSecond,
+            engineTimeMilliseconds: lastInfo.engineTimeMilliseconds
         )
     }
 
@@ -207,21 +245,76 @@ actor UCCIEngineClient {
     }
 }
 
-private struct EngineInfoAccumulator {
-    var depth: Int?
-    var score: Int?
-    var pv: [String] = []
+struct EngineInfoAccumulator {
+    private(set) var depth: Int?
+    private(set) var selectiveDepth: Int?
+    private(set) var scoreCentipawns: Int?
+    private(set) var mateInMoves: Int?
+    private(set) var nodes: Int?
+    private(set) var nodesPerSecond: Int?
+    private(set) var engineTimeMilliseconds: Int?
+    private(set) var principalVariation: [String] = []
 
     mutating func consume(line: String) {
         let tokens = line.split(separator: " ").map(String.init)
-        if let index = tokens.firstIndex(of: "depth"), tokens.indices.contains(index + 1) {
-            depth = Int(tokens[index + 1])
+        guard tokens.first == "info" else { return }
+        if let multipvIndex = tokens.firstIndex(of: "multipv") {
+            guard tokens.indices.contains(multipvIndex + 1), Int(tokens[multipvIndex + 1]) == 1 else {
+                return
+            }
         }
-        if let index = tokens.firstIndex(of: "score"), tokens.indices.contains(index + 2) {
-            score = Int(tokens[index + 2])
-        }
-        if let index = tokens.firstIndex(of: "pv") {
-            pv = Array(tokens.dropFirst(index + 1).prefix(32))
+
+        var index = 1
+        while index < tokens.count {
+            switch tokens[index] {
+            case "depth":
+                if tokens.indices.contains(index + 1), let value = Int(tokens[index + 1]) {
+                    depth = value
+                }
+                index += 2
+            case "seldepth":
+                if tokens.indices.contains(index + 1), let value = Int(tokens[index + 1]) {
+                    selectiveDepth = value
+                }
+                index += 2
+            case "nodes":
+                if tokens.indices.contains(index + 1), let value = Int(tokens[index + 1]) {
+                    nodes = value
+                }
+                index += 2
+            case "nps":
+                if tokens.indices.contains(index + 1), let value = Int(tokens[index + 1]) {
+                    nodesPerSecond = value
+                }
+                index += 2
+            case "time":
+                if tokens.indices.contains(index + 1), let value = Int(tokens[index + 1]) {
+                    engineTimeMilliseconds = value
+                }
+                index += 2
+            case "score":
+                guard tokens.indices.contains(index + 2), let value = Int(tokens[index + 2]) else {
+                    index += 1
+                    continue
+                }
+                switch tokens[index + 1] {
+                case "cp":
+                    scoreCentipawns = value
+                    mateInMoves = nil
+                case "mate":
+                    mateInMoves = value
+                    scoreCentipawns = nil
+                default:
+                    break
+                }
+                index += 3
+            case "pv":
+                let variation = Array(tokens.dropFirst(index + 1).prefix(32))
+                if !variation.isEmpty { principalVariation = variation }
+                return
+            default:
+                index += 1
+            }
         }
     }
 }

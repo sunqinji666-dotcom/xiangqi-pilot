@@ -4,5 +4,7 @@ DerivedData/
 *.xcuserstate
 .DS_Store
 XiangqiPilot.app/
+dist/*.zip
+dist/*.sha256
 Vendor/Pikafish/
 :-

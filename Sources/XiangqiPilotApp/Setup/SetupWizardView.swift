@@ -278,6 +278,20 @@ private struct WindowSetupStep: View {
             }
             .pickerStyle(.segmented)
 
+            if runtime.presentation.selectedGame == .xiangqi {
+                Button {
+                    runtime.startAICollaboration()
+                } label: {
+                    Label("启动 AI 协同决策", systemImage: "bolt.horizontal.circle.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(CockpitActionButtonStyle(color: CockpitPalette.cyan))
+
+                Text("不选择窗口、不读取画面、不执行点击。孙小吉负责读盘和点击，驾驶舱只校验棋规并分析。")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(CockpitPalette.secondaryText)
+            }
+
             ScrollView {
                 LazyVStack(spacing: 8) {
                     ForEach(runtime.availableWindows) { window in

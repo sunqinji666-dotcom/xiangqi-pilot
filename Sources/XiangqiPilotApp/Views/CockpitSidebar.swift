@@ -104,11 +104,11 @@ struct CockpitSidebar: View {
 
             HStack(spacing: 6) {
                 StatusDot(color: CockpitPalette.green)
-                Text("窗口已锁定")
+                Text(model.source.isLocked ? "窗口已锁定" : "AI协同")
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(CockpitPalette.green)
                 Spacer()
-                Text("60 Hz")
+                Text(model.source.isLocked ? "60 Hz" : "AI点击")
                     .font(.system(size: 10, weight: .medium, design: .monospaced))
                     .foregroundStyle(CockpitPalette.tertiaryText)
             }

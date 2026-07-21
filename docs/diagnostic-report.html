@@ -1,0 +1,296 @@
+<body>
+<style>
+  :root { --bg: #0d1117; --surface: #161b22; --border: #30363d; --text: #e6edf3; --muted: #8b949e; --red: #f85149; --orange: #d29922; --green: #3fb950; --blue: #58a6ff; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif; background: var(--bg); color: var(--text); line-height: 1.6; padding: 2rem; max-width: 1100px; margin: 0 auto; }
+  h1 { font-size: 1.8rem; margin-bottom: 0.5rem; }
+  h2 { font-size: 1.4rem; margin: 2rem 0 1rem; padding-bottom: 0.5rem; border-bottom: 1px solid var(--border); }
+  h3 { font-size: 1.1rem; margin: 1.5rem 0 0.8rem; color: var(--blue); }
+  p, li { color: var(--text); font-size: 0.92rem; }
+  .subtitle { color: var(--muted); margin-bottom: 2rem; }
+  .summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin: 1.5rem 0; }
+  .summary-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.2rem; }
+  .summary-card .number { font-size: 2rem; font-weight: 700; }
+  .summary-card .label { color: var(--muted); font-size: 0.85rem; }
+  .critical .number { color: var(--red); }
+  .warning .number { color: var(--orange); }
+  .info .number { color: var(--blue); }
+  .ok .number { color: var(--green); }
+  .issue { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1rem 1.2rem; margin: 0.8rem 0; }
+  .issue-header { display: flex; align-items: center; gap: 0.6rem; margin-bottom: 0.5rem; }
+  .severity { font-size: 0.75rem; font-weight: 600; padding: 2px 8px; border-radius: 4px; text-transform: uppercase; }
+  .severity.critical { background: rgba(248,81,73,0.15); color: var(--red); }
+  .severity.high { background: rgba(210,153,34,0.15); color: var(--orange); }
+  .severity.medium { background: rgba(88,166,255,0.15); color: var(--blue); }
+  .issue-title { font-weight: 600; font-size: 0.95rem; }
+  .issue p { color: var(--muted); font-size: 0.88rem; }
+  .file-ref { font-family: 'SF Mono', monospace; font-size: 0.8rem; color: var(--blue); background: rgba(88,166,255,0.1); padding: 1px 6px; border-radius: 3px; }
+  code { font-family: 'SF Mono', monospace; font-size: 0.82rem; background: rgba(110,118,129,0.15); padding: 1px 5px; border-radius: 3px; }
+  pre { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 1rem; overflow-x: auto; margin: 0.5rem 0; }
+  pre code { background: none; padding: 0; font-size: 0.8rem; }
+  .phase { display: flex; align-items: stretch; margin: 1.5rem 0; }
+  .phase-step { flex: 1; background: var(--surface); border: 1px solid var(--border); padding: 1rem; text-align: center; position: relative; }
+  .phase-step:not(:last-child)::after { content: '→'; position: absolute; right: -8px; top: 50%; transform: translateY(-50%); color: var(--muted); z-index: 1; font-size: 1.2rem; }
+  .phase-step .step-name { font-weight: 600; font-size: 0.85rem; margin-bottom: 0.3rem; }
+  .phase-step .step-desc { color: var(--muted); font-size: 0.75rem; }
+  .phase-step.broken { border-color: var(--red); background: rgba(248,81,73,0.05); }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0; font-size: 0.88rem; }
+  th, td { text-align: left; padding: 0.6rem 0.8rem; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 600; font-size: 0.8rem; text-transform: uppercase; }
+  .plan-section { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin: 1rem 0; }
+  .plan-phase { font-weight: 700; color: var(--green); font-size: 0.85rem; text-transform: uppercase; margin-bottom: 0.5rem; }
+  ul { padding-left: 1.5rem; }
+  li { margin: 0.3rem 0; }
+  .toc { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.2rem 1.5rem; margin: 1.5rem 0; }
+  .toc a { color: var(--blue); text-decoration: none; font-size: 0.9rem; display: block; padding: 0.2rem 0; }
+  .toc a:hover { text-decoration: underline; }
+</style>
+
+<h1>XiangqiPilot 全面诊断报告</h1>
+<p class="subtitle">2026-07-21 · 覆盖识别模块、点击执行、运行时状态、UI 架构四个维度</p>
+
+<div class="summary-grid">
+  <div class="summary-card critical"><div class="number">7</div><div class="label">致命问题（直接导致不可用）</div></div>
+  <div class="summary-card warning"><div class="number">14</div><div class="label">高严重度问题</div></div>
+  <div class="summary-card info"><div class="number">12</div><div class="label">中严重度问题</div></div>
+  <div class="summary-card ok"><div class="number">108</div><div class="label">测试通过（但覆盖不足）</div></div>
+</div>
+
+<div class="toc">
+  <strong>目录</strong>
+  <a href="#verdict">一、总判断：为什么"用不了"</a>
+  <a href="#recognition">二、识别模块：20+ 硬编码阈值 + 几乎必触发的审核</a>
+  <a href="#click">三、点击执行：10 层验证让成功路径极窄</a>
+  <a href="#runtime">四、运行时状态：三套状态系统互相打架</a>
+  <a href="#architecture">五、架构层面：4239 行的 God Object</a>
+  <a href="#plan">六、重构路线图</a>
+</div>
+
+<h2 id="verdict">一、总判断：为什么"用不了"</h2>
+
+<p>不是某一个功能有 bug，而是<strong>整条链路上的每一环都在叠加失败概率</strong>。一次成功的操作需要连续通过：</p>
+
+<div class="phase">
+  <div class="phase-step broken"><div class="step-name">截屏</div><div class="step-desc">0.5pt 容差<br>窗口移动即失效</div></div>
+  <div class="phase-step broken"><div class="step-name">识别</div><div class="step-desc">20+ 魔法阈值<br>几乎必触发人工审核</div></div>
+  <div class="phase-step broken"><div class="step-name">状态同步</div><div class="step-desc">三套状态系统<br>两套是死代码</div></div>
+  <div class="phase-step broken"><div class="step-name">点击</div><div class="step-desc">10 层验证<br>权限检查 4 次</div></div>
+  <div class="phase-step broken"><div class="step-name">验证</div><div class="step-desc">帧指纹竞态<br>30s 超时</div></div>
+</div>
+
+<p>每个环节 90% 的成功率，串联起来就是 59%。实际上识别和点击环节的成功率远低于 90%。</p>
+
+<h2 id="recognition">二、识别模块</h2>
+
+<div class="issue">
+  <div class="issue-header"><span class="severity critical">致命</span><span class="issue-title">requiresHumanReview 几乎永远为 true</span></div>
+  <p><span class="file-ref">XiangqiVisionRecognizer.swift:55-60</span></p>
+  <p><code>confidence</code> = mean × completeness，当 32 个子只有 2 个已知颜色时，completeness = 2/32 = 0.0625。即使 mean = 0.99，最终 confidence = 0.062，远低于 0.985 的门槛。加上 <code>hasCompleteClassification</code> 的冗余检查，<strong>几乎任何有 unknown 子的局面都会触发人工审核</strong>，自动模式形同虚设。</p>
+</div>
+
+<div class="issue">
+  <div class="issue-header"><span class="severity critical">致命</span><span class="issue-title">796 行巨型类承担 5 种不同职责</span></div>
+  <p><span class="file-ref">XiangqiVisionRecognizer.swift</span></p>
+  <p>OCR、模板匹配、占位检测、颜色估计、补丁比对全部塞在一个类里。任何一项修改都需要重新理解整个文件。不同棋盘皮肤的适配需要在十几个耦合的阈值间反复试错。</p>
+</div>
+
+<div class="issue">
+  <div class="issue-header"><span class="severity high">高</span><span class="issue-title">20+ 硬编码魔法阈值，无系统性推导</span></div>
+  <p>散布在多个文件中的关键阈值举例：</p>
+  <table>
+    <tr><th>阈值</th><th>位置</th><th>用途</th></tr>
+    <tr><td><code>0.30 / 0.018</code></td><td>XiangqiVisionRecognizer:107</td><td>模板匹配接受条件</td></tr>
+    <tr><td><code>0.985</code></td><td>XiangqiVisionRecognizer:304</td><td>人工审核门槛</td></tr>
+    <tr><td><code>0.62 / 0.025</code></td><td>XiangqiVisionRecognizer:499</td><td>占位检测亮度/对比度</td></tr>
+    <tr><td><code>red - max(g,b) >= 8</code></td><td>XiangqiVisionRecognizer:690</td><td>红方颜色判定</td></tr>
+    <tr><td><code>0.42 / 0.50 / 0.18</code></td><td>GridStoneRecognizer:53-63</td><td>五子棋颜色分类</td></tr>
+    <tr><td><code>0.675, 0.355, 0.285, 0.365</code></td><td>XiangqiWizardMoveLogReader:100</td><td>着法列表裁剪区域</td></tr>
+  </table>
+  <p>换一套棋盘皮肤就需要重新校准这些数字，且它们之间存在微妙耦合——改一个可能影响其他所有判定。</p>
+</div>
+
+<div class="issue">
+  <div class="issue-header"><span class="severity high">高</span><span class="issue-title">颜色估计过于粗糙</span></div>
+  <p><span class="file-ref">XiangqiVisionRecognizer.swift:673-696</span></p>
+  <p>红方判定用绝对差值 <code>>= 8</code> + 比例 <code>>= 1.10</code>，偏暗的红色棋子容易失败。黑方判定 <code>max(g,b) - r >= 4</code> 极其宽松，任何略微偏蓝/绿的像素都判为黑方。GridStoneRecognizer 用 12×12 像素采样判定颜色，抗锯齿和压缩伪影就能搞乱结果。</p>
+</div>
+
+<div class="issue">
+  <div class="issue-header"><span class="severity high">高</span><span class="issue-title">硬编码绝对路径 + 静默失败</span></div>
+  <p><span class="file-ref">XiangqiVisionRecognizer.swift (XQWizardTemplateLibrary)</span></p>
+  <p>模板库直接硬编码 <code>/Applications/象棋巫师.app/Wrapper/XQWizard.app</code>。如果用户安装在其他位置，模板加载返回空数组，模板匹配路径完全不工作，但<strong>没有任何错误提示</strong>。</p>
+</div>
+
+<div class="issue">
+  <div class="issue-header"><span class="severity medium">中</span><span class="issue-title">占位检测与 OCR 取并集导致频繁触发审核</span></div>
+  <p><span class="file-ref">XiangqiVisionRecognizer.swift:434-438</span></p>
+  <p>每次 OCR 漏识别一个子，occupiedCells 会包含这个格子但 pieces 不会——直接触发人工审核。自动模式下导致频繁暂停。</p>
+</div>
+
+<div class="issue">
+  <div class="issue-header"><span class="severity medium">中</span><span class="issue-title">StableFrameGate 的 120ms 稳定等待 + 帧差检测误判</span></div>
+  <p><span class="file-ref">BoardFrameDifferencer.swift:132-163</span></p>
+  <p>棋子移动动画会导致帧间差异被误判为 materialChange，重置 stableSince，门控长时间不通过。两个不同的 minimumScore 阈值（0.07 vs 0.035）没有文档说明。</p>
+</div>
+
+<div class="issue">
+  <div class="issue-header"><span class="severity medium">中</span><span class="issue-title">~75 行死代码 + 3 个永远返回 nil 的 stub 方法</span></div>
+  <p><span class="file-ref">XiangqiVisionRecognizer.swift:575-648</span> (inferRepeatedPieceTemplates 从未被调用)</p>
+  <p><span class="file-ref">RecognitionTransitionPolicy.swift:56-74</span> (decoratedLegalLine/Move/Reply 始终返回 nil，但 Runtime 中有 5 处调用)</p>
+</div>
+
+<h2 id="click">三、点击执行</h2>
+
+<div class="issue">
+  <div class="issue-header"><span class="severity critical">致命</span><span class="issue-title">10+ 层验证让成功路径极窄</span></div>
+  <p><span class="file-ref">ClickExecutor.swift:597-700</span></p>
+  <p>一次点击需要连续通过：状态机检查 → 无进行中动作 → 起终点不同 → 获取帧 → epoch 检查 → 12 项前置条件（权限×2、hash、PID、windowID、geometryHash、frameSequence、contentFingerprint、fingerprint、stableFrames、imageSize、窗口权威）→ ROI 检查 → 遮挡检测 → 再检查 epoch → 延迟 260ms → 又检查 epoch → 窗口几何验证 → 又遮挡检测 → 第二次点击 → 30 秒超时验证 → 最终帧验证。</p>
+  <p><strong>权限检查执行了 4 次，ensureStillExecuting() 调用了 5 次</strong>。大量重复检查不仅拖慢速度，还增加了某一环意外失败的概率。</p>
+</div>
+
+<div class="issue">
+  <div class="issue-header"><span class="severity critical">致命</span><span class="issue-title">safetyEpoch 机制让飞行中的点击必然失败</span></div>
+  <p><span class="file-ref">ClickExecutor.swift:185-210</span></p>
+  <p>任何外部 <code>pause()</code> 调用都会递增 safetyEpoch，导致正在执行的点击立即失败。而帧捕获循环中的 <code>reconcileTrustedPosition()</code> 检测到视觉变化就会触发 pause——<strong>点击本身引起的画面变化反而会中断点击</strong>。</p>
+</div>
+
+<div class="issue">
+  <div class="issue-header"><span class="severity critical">致命</span><span class="issue-title">verify() 帧指纹竞态</span></div>
+  <p><span class="file-ref">ClickExecutor.swift:745-760</span></p>
+  <p>要求点击后帧指纹必须与点击前不同。但如果棋子移动动画尚未完成，恰好捕获到与之前指纹相同的中间帧，验证就会失败。20fps 帧率 + 120ms 动画时间，这种竞态完全可能发生。</p>
+</div>
+
+<div class="issue">
+  <div class="issue-header"><span class="severity high">高</span><span class="issue-title">错误恢复只有一种策略：暂停</span></div>
+  <p><span class="file-ref">PilotRuntime.swift (pause 方法)</span></p>
+  <p>无论权限丢失、窗口消失、帧过期、状态不匹配还是点击失败，唯一的应对都是暂停等用户手动干预。窗口轻微移动（重新获取 calibration 就能解决）和帧短暂不稳定（等几帧就好）这种常见问题也不会自动恢复。</p>
+</div>
+
+<div class="issue">
+  <div class="issue-header"><span class="severity high">高</span><span class="issue-title">calibration 尺寸容差仅 0.5 点</span></div>
+  <p><span class="file-ref">BoardCalibration.swift (matchesSize)</span></p>
+  <p>macOS 在 HiDPI 和非 HiDPI 显示器之间移动窗口时，窗口尺寸可能发生亚像素变化（800.0 → 799.5），直接导致 calibration 失效抛出 windowGeometryChanged。</p>
+</div>
+
+<div class="issue">
+  <div class="issue-header"><span class="severity medium">中</span><span class="issue-title">窗口激活的竞态条件</span></div>
+  <p><span class="file-ref">ClickExecutor.swift:218-330</span></p>
+  <p>Accessibility 提升窗口和帧稳定检查之间，macOS 可能正在执行窗口动画。120ms 的稳定窗口要求不足以跨越完整的动画周期。</p>
+</div>
+
+<h2 id="runtime">四、运行时状态管理</h2>
+
+<div class="issue">
+  <div class="issue-header"><span class="severity critical">致命</span><span class="issue-title">三套状态系统，两套是废的</span></div>
+  <p>项目中存在三套独立的状态管理：</p>
+  <table>
+    <tr><th>系统</th><th>状态</th><th>实际情况</th></tr>
+    <tr><td><code>SessionStateMachine</code></td><td>13 个状态 + 完整转换表</td><td><strong>完全未使用</strong>——声明后从未调用任何方法</td></tr>
+    <tr><td><code>AutomationControlState</code></td><td>ClickExecutor 内部</td><td>仅在 actor 内部使用</td></tr>
+    <tr><td><code>PilotPhase</code> (presentation.phase)</td><td>6 个阶段</td><td><strong>实际驱动 UI</strong>——在 40+ 处直接赋值，无转换约束</td></tr>
+  </table>
+  <p>设计意图（SessionStateMachine）和实际实现（散乱的 phase 赋值）完全脱节。</p>
+</div>
+
+<div class="issue">
+  <div class="issue-header"><span class="severity critical">致命</span><span class="issue-title">presentation.phase 在 40+ 处直接赋值，无约束</span></div>
+  <p><span class="file-ref">PilotRuntime.swift + PresentationModels.swift</span></p>
+  <p>任何地方都可以把 phase 改成任何值。可以从 .acting 直接跳到 .observing（跳过 verifying），也可以在 .previewing 时变成 .thinking。没有编译时或运行时保障来防止非法状态转换。</p>
+</div>
+
+<div class="issue">
+  <div class="issue-header"><span class="severity high">高</span><span class="issue-title">双重 ObservableObject 导致数据流分叉</span></div>
+  <p>PilotRuntime 和 PilotPresentationModel 都是 ObservableObject，各自有大量 @Published 属性。一次业务操作可能同时修改两个对象，触发两次独立的 SwiftUI 更新周期，且更新顺序不确定。</p>
+</div>
+
+<div class="issue">
+  <div class="issue-header"><span class="severity high">高</span><span class="issue-title">两套平行的领域模型</span></div>
+  <table>
+    <tr><th>XiangqiCore</th><th>PresentationModels</th></tr>
+    <tr><td><code>Side</code></td><td><code>XiangqiSide</code></td></tr>
+    <tr><td><code>Square</code> (file/rank)</td><td><code>BoardCoordinate</code> (column/row)</td></tr>
+    <tr><td><code>Piece</code> (side/kind)</td><td><code>BoardPiece</code> (side/character:String)</td></tr>
+    <tr><td><code>Move</code> (from/to)</td><td><code>CandidateMove</code></td></tr>
+  </table>
+  <p>每次数据流动都需要手动转换，转换代码散布在 Runtime 各处。</p>
+</div>
+
+<h2 id="architecture">五、架构层面</h2>
+
+<div class="issue">
+  <div class="issue-header"><span class="severity critical">致命</span><span class="issue-title">PilotRuntime.swift: 4,239 行的 God Object</span></div>
+  <p>一个文件承担了 12+ 个不同职责：设置向导、权限管理、窗口捕获轮询、棋盘标定、象棋识别调度、网格棋识别调度、引擎分析、着法执行、画面校验、异常恢复、AI 协同桥接、会话持久化。</p>
+  <p>这是所有问题的放大器——任何修改都需要在这个巨型文件中理解上下文，改一处影响全局。</p>
+</div>
+
+<div class="issue">
+  <div class="issue-header"><span class="severity high">高</span><span class="issue-title">PresentationModel: 40 个 @Published + 19 个回调闭包</span></div>
+  <p><span class="file-ref">PresentationModels.swift (755 行)</span></p>
+  <p>恢复系统独占 14 个状态字段，象棋和网格棋状态混在一起。每次任何状态变化都触发所有观察者的 View 重新求值。19 个 onXxx 闭包使得数据流极难追踪。</p>
+</div>
+
+<div class="issue">
+  <div class="issue-header"><span class="severity medium">中</span><span class="issue-title">View 直接通过 Binding 修改 Runtime 属性</span></div>
+  <p><span class="file-ref">SetupWizardView.swift</span></p>
+  <p>用户可以在识别流程进行中改变 sideToMove，没有任何业务验证。</p>
+</div>
+
+<div class="issue">
+  <div class="issue-header"><span class="severity medium">中</span><span class="issue-title">synchronizePresentation 手动调用，散布在多个路径</span></div>
+  <p>如果某个路径忘记调用，UI 就显示过期数据。没有编译时保证，也没有运行时断言。</p>
+</div>
+
+<h2 id="plan">六、重构路线图</h2>
+
+<p>建议分三个阶段，每个阶段独立可交付、可测试：</p>
+
+<div class="plan-section">
+  <div class="plan-phase">Phase 1 — 打通最小可用链路（1-2 周）</div>
+  <p><strong>目标：让"识别 → 分析 → 点击"这条路至少能跑通</strong></p>
+  <ul>
+    <li><strong>修复 requiresHumanReview 的逻辑 bug</strong>：移除 confidence 中 completeness 的惩罚因子，或把阈值从 0.985 降到合理水平</li>
+    <li><strong>精简 ClickExecutor 的验证链</strong>：权限检查只保留一次，移除重复的 ensureStillExecuting，合并窗口验证</li>
+    <li><strong>修复 safetyEpoch 竞态</strong>：execute() 执行期间冻结 epoch，或改用 scoped token 机制</li>
+    <li><strong>calibration 容差放宽</strong>：从 0.5pt 改为 2-3pt，或加入自适应容差</li>
+    <li><strong>添加自动恢复路径</strong>：窗口轻微移动 → 自动重新获取 calibration；帧短暂不稳定 → 等待 N 帧后重试</li>
+    <li><strong>删除死代码</strong>：SessionStateMachine（或接入使用）、inferRepeatedPieceTemplates、stub 方法</li>
+  </ul>
+</div>
+
+<div class="plan-section">
+  <div class="plan-phase">Phase 2 — 识别系统重建（2-3 周）</div>
+  <p><strong>目标：识别准确率从"基本不可用"提升到"大多数场景可用"</strong></p>
+  <ul>
+    <li><strong>拆分 XiangqiVisionRecognizer</strong>：分离 OccupancyDetector、SideEstimator、TemplateMatcher</li>
+    <li><strong>将魔法阈值提取为可配置的 RecognitionProfile</strong>：每个客户端/棋盘皮肤一套参数，不再硬编码</li>
+    <li><strong>改进颜色估计</strong>：用 HSV 色彩空间替代 RGB 绝对差值，增大采样区域</li>
+    <li><strong>修复 OCR 候选选择逻辑</strong>：不再选择"低置信度"候选</li>
+    <li><strong>移除硬编码路径</strong>：模板库通过用户选择或自动发现加载</li>
+    <li><strong>统一坐标系统</strong>：定义 ScreenPoint / ImagePoint / NormalizedPoint 类型，利用编译器防止混淆</li>
+  </ul>
+</div>
+
+<div class="plan-section">
+  <div class="plan-phase">Phase 3 — 架构治理（3-4 周）</div>
+  <p><strong>目标：代码可维护、可测试、可扩展</strong></p>
+  <ul>
+    <li><strong>拆分 PilotRuntime</strong>：SetupCoordinator、CaptureLoop、AnalysisCoordinator、ExecutionCoordinator、RecoveryCoordinator</li>
+    <li><strong>统一状态管理</strong>：让 SessionStateMachine 成为唯一真相源，phase 变为派生属性</li>
+    <li><strong>合并双重 ObservableObject</strong>：一个 ObservableObject，分拆为子模型（RecoveryModel、GridGameModel）</li>
+    <li><strong>消除重复领域模型</strong>：View 层直接使用 XiangqiCore 类型 + 渲染扩展</li>
+    <li><strong>用协议替代 19 个闭包</strong>：定义 PilotRuntimeDelegate 协议</li>
+  </ul>
+</div>
+
+<h2>附录：代码量统计</h2>
+<table>
+  <tr><th>文件</th><th>行数</th><th>评价</th></tr>
+  <tr><td>PilotRuntime.swift</td><td>4,239</td><td style="color:var(--red)">严重过大，需拆分</td></tr>
+  <tr><td>ClickExecutor.swift</td><td>1,197</td><td style="color:var(--orange)">偏大但职责单一</td></tr>
+  <tr><td>XiangqiVisionRecognizer.swift</td><td>795</td><td style="color:var(--orange)">需拆分</td></tr>
+  <tr><td>PresentationModels.swift</td><td>755</td><td style="color:var(--orange)">需拆分子模型</td></tr>
+  <tr><td>SetupWizardView.swift</td><td>666</td><td style="color:var(--blue)">可接受</td></tr>
+  <tr><td>XiangqiCore (7 files)</td><td>~1,600</td><td style="color:var(--green)">设计良好，是项目最干净的部分</td></tr>
+</table>
+
+</body>

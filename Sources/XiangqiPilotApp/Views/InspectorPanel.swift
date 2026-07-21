@@ -9,8 +9,7 @@ struct InspectorPanel: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
                 recognitionStatus
-                candidatesSection
-                controlModeSection
+                executionBridgeSection
                 sourcesSection
                 safetySection
             }
@@ -90,25 +89,19 @@ struct InspectorPanel: View {
                     }
                 }
             }
+
+            HStack(spacing: 5) {
+                StatusDot(color: model.collaborationStatus.contains("已连接") ? CockpitPalette.green : CockpitPalette.secondaryText)
+                Text(model.collaborationLatencyMilliseconds.map {
+                    "本机协同 · \(model.collaborationStatus) · \(Int($0)) ms"
+                } ?? "本机协同 · \(model.collaborationStatus)")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(CockpitPalette.secondaryText)
+                    .lineLimit(1)
+            }
         }
         .padding(13)
         .cockpitPanel(cornerRadius: 13, raised: true)
-    }
-
-    private var candidatesSection: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            SectionLabel(title: "候选着法", detail: model.engineSource.title)
-
-            ForEach(Array(model.candidates.enumerated()), id: \.element.id) { index, candidate in
-                CandidateMoveRow(
-                    rank: index + 1,
-                    candidate: candidate,
-                    isSelected: candidate.id == model.selectedCandidateID
-                ) {
-                    model.chooseCandidate(candidate)
-                }
-            }
-        }
     }
 
     private var gridDeviationText: String {
@@ -116,86 +109,18 @@ struct InspectorPanel: View {
         return "\(value.formatted(.number.precision(.fractionLength(1)))) px"
     }
 
-    private var controlModeSection: some View {
+    private var executionBridgeSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            SectionLabel(title: "操作模式")
-
-            Picker("操作模式", selection: $model.controlMode) {
-                ForEach(ControlMode.allCases) { mode in
-                    Text(mode.title).tag(mode)
-                }
-            }
-            .pickerStyle(.segmented)
-
-            if model.selectedGame != .xiangqi {
-                Toggle("双方自动自测", isOn: $model.gridSelfPlayEnabled)
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(CockpitPalette.secondaryText)
-                    .toggleStyle(.switch)
-            }
-
+            SectionLabel(title: "极速执行协作")
             HStack(alignment: .top, spacing: 7) {
-                Image(systemName: modeSymbol)
+                Image(systemName: "bolt.horizontal.circle.fill")
                     .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(modeColor)
+                    .foregroundStyle(CockpitPalette.cyan)
                     .padding(.top, 1)
-                Text(model.controlMode.detail)
+                Text("驾驶舱仅校验局面、计算落点并发出本机指令；最终点击由孙小吉执行并回传。")
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(CockpitPalette.secondaryText)
                 Spacer()
-            }
-
-            Button {
-                model.confirmSelectedMove()
-            } label: {
-                HStack {
-                    Image(systemName: model.controlMode == .assist ? "sparkles" : "cursorarrow.click.2")
-                    Text(primaryActionTitle)
-                    Spacer()
-                    if model.controlMode == .confirm {
-                        Text(model.selectedCandidate.notation)
-                            .font(.system(size: 11, weight: .bold))
-                    }
-                }
-                .padding(.horizontal, 2)
-                .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(CockpitActionButtonStyle(color: modeColor))
-            .disabled(
-                model.isPaused
-                    || model.isEmergencyStopped
-                    || model.phase != .previewing
-            )
-            .opacity(
-                model.isPaused
-                    || model.isEmergencyStopped
-                    || model.phase != .previewing
-                    ? 0.42 : 1
-            )
-
-            if model.selectedGame == .go {
-                Button(role: .destructive) {
-                    showsConcedeConfirmation = true
-                } label: {
-                    Label("结束当前围棋局（认输）", systemImage: "flag.fill")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .disabled(
-                    model.isPaused
-                        || model.isEmergencyStopped
-                        || model.phase == .acting
-                        || model.phase == .verifying
-                )
-                .alert("确认在锁定的腾讯围棋窗口中认输？", isPresented: $showsConcedeConfirmation) {
-                    Button("取消", role: .cancel) {}
-                    Button("确认认输", role: .destructive) {
-                        model.concedeCurrentGame()
-                    }
-                } message: {
-                    Text("驾驶舱将只点击已验证的“认输”和确认控件，并等待客户端终局回执。")
-                }
             }
         }
         .padding(13)
@@ -309,9 +234,9 @@ struct InspectorPanel: View {
             }
 
             safetyRow(
-                "目标窗口锁定",
-                detail: model.source.isLocked ? "通过" : "未锁定",
-                color: model.source.isLocked ? CockpitPalette.green : CockpitPalette.amber
+                model.source.isLocked ? "目标窗口锁定" : "AI视觉与点击",
+                detail: model.source.isLocked ? "通过" : "AI负责",
+                color: CockpitPalette.green
             )
             safetyRow(
                 "局面可信基准",
