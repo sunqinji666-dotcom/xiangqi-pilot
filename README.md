@@ -6,6 +6,10 @@
 
 这是一个运行在 macOS 上的棋盘游戏驾驶舱。它可以看棋盘、认局面、找走法、接入引擎，也可以在确认安全之后帮你点击下一步。
 
+**简体中文** · [繁體中文](docs/README.zh-TW.md) · [English](docs/README.en.md) · [日本語](docs/README.ja.md) · [한국어](docs/README.ko.md) · [Español](docs/README.es.md) · [Français](docs/README.fr.md) · [Deutsch](docs/README.de.md) · [Português](docs/README.pt-BR.md) · [Русский](docs/README.ru.md) · [العربية](docs/README.ar.md) · [हिन्दी](docs/README.hi.md) · [Bahasa Indonesia](docs/README.id.md)
+
+作者与联系：**Jacksun（孙秦吉）** · [qinji@jack-sun.com](mailto:qinji@jack-sun.com)
+
 ![macOS](https://img.shields.io/badge/macOS-14%2B-111827?style=flat-square&logo=apple&logoColor=white)
 ![Swift](https://img.shields.io/badge/Swift-5.10%2B-F97316?style=flat-square&logo=swift&logoColor=white)
 ![Version](https://img.shields.io/badge/version-v0.5.0-6366F1?style=flat-square)
@@ -242,6 +246,6 @@ XiangqiPilot/
 
 ## 许可证与第三方声明
 
-XiangqiPilot 自身的许可证策略仍在确定中。Pikafish 及其网络文件遵循各自的许可证和分发要求，详见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
+XiangqiPilot 自身采用 [MIT License](LICENSE) 开源。Pikafish 及其网络文件遵循各自的许可证和分发要求，详见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
 
 如果你想了解某个功能为什么会停、某一步是怎么判断的，优先看 `RuntimeDiagnostics`、`Recognition` 和 `Tests` 里的对应实现与测试。
